@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import pandas_ta as ta
 import numpy as np
 import ccxt
 import sqlite3
@@ -9,22 +8,55 @@ from datetime import datetime, timedelta, timezone
 import time
 
 # ==========================================
-# 🚀 COSMIC 108 — SMART MARKET RADAR V1.7.4
-# Institutional Upgrade: Active FVG/OB, Trigger Persistence & ATR SL
+# 🚀 COSMIC 108 — SMART MARKET RADAR V1.7.5
+# Zero External Dependency Edition (No pandas-ta)
 # ==========================================
 
-st.set_page_config(page_title="COSMIC 108 | Institutional Radar V1.7.4", layout="wide")
+st.set_page_config(page_title="COSMIC 108 | Institutional Radar V1.7.5", layout="wide")
 
 DB_FILE = "cosmic108.db"
 TARGET_COINS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT"]
 TIMEFRAMES = ["1d", "4h", "1h", "15m", "5m"]
-ANALYSIS_VERSION = "V1.7.4_INST"
+ANALYSIS_VERSION = "V1.7.5_PROD"
 
 # ==========================================
-# 1. HARDENED SQLITE CONNECTION & SCHEMA
+# 1. PURE PANDAS TECHNICAL INDICATORS (No pandas-ta)
+# ==========================================
+def calculate_indicators(df):
+    """ Pure Pandas/Numpy implementations for EMA, RSI, ATR, SMA to avoid build errors """
+    df = df.copy()
+    close = df['close']
+    high = df['high']
+    low = df['low']
+    volume = df['volume']
+    
+    # EMA 50 & 200
+    df['ema_50'] = close.ewm(span=50, adjust=False).mean()
+    df['ema_200'] = close.ewm(span=200, adjust=False).mean() if len(df) >= 200 else np.nan
+    
+    # RSI 14
+    delta = close.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['rsi_14'] = 100 - (100 / (1 + rs))
+    
+    # ATR 14
+    tr1 = high - low
+    tr2 = abs(high - close.shift())
+    tr3 = abs(low - close.shift())
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df['atr_14'] = tr.rolling(window=14).mean()
+    
+    # Volume SMA 20
+    df['vol_sma_20'] = volume.rolling(window=20).mean()
+    
+    return df
+
+# ==========================================
+# 2. SMART SQLITE & SCHEMA
 # ==========================================
 def get_db_connection():
-    """ Safe connection with concurrency timeout and multi-thread allowance """
     conn = sqlite3.connect(DB_FILE, timeout=30.0, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA busy_timeout=30000;")
@@ -77,7 +109,7 @@ def init_db():
 init_db()
 
 # ==========================================
-# 2. LIVE CCXT DATA INGESTION ENGINE
+# 3. LIVE CCXT INGESTION ENGINE
 # ==========================================
 @st.cache_resource
 def get_exchange_instance():
@@ -106,7 +138,7 @@ def fetch_and_store_live_candles(progress_bar, status_text):
                 limit = 400
                 if last_ts_str:
                     last_dt = datetime.fromisoformat(last_ts_str)
-                    since = int(last_dt.timestamp() * 1000) + 1 # Avoid duplicate boundary overlap
+                    since = int(last_dt.timestamp() * 1000) + 1
                     limit = 100
                 
                 ohlcv = exchange.fetch_ohlcv(coin, tf, since=since, limit=limit)
@@ -154,19 +186,15 @@ def load_raw_candles(symbol, timeframe, limit=500):
     return filter_closed_candles(df, timeframe)
 
 # ==========================================
-# 3. V1.7.4 CAUSAL ANALYSIS & LIFECYCLE ENGINE
+# 4. ANALYSIS & PIPELINE ENGINE V1.7.5
 # ==========================================
-def run_v174_analysis(df):
-    # Minimum Guard: At least 250 candles required for accurate EMA 200 & structure
-    if df.empty or len(df) < 250:
+def run_v175_analysis(df):
+    if df.empty or len(df) < 50:
         return df, []
     df = df.copy()
     
-    df['ema_50'] = ta.ema(df['close'], length=50)
-    df['ema_200'] = ta.ema(df['close'], length=200) 
-    df['rsi_14'] = ta.rsi(df['close'], length=14)
-    df['atr_14'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-    df['vol_sma_20'] = ta.sma(df['volume'], length=20)
+    # Calculate Indicators via pure pandas
+    df = calculate_indicators(df)
     
     df['ema_bias'] = np.where(pd.notna(df['ema_200']) & (df['close'] > df['ema_200']), 'Bullish',
                      np.where(pd.notna(df['ema_200']) & (df['close'] < df['ema_200']), 'Bearish', 'Neutral'))
@@ -225,7 +253,6 @@ def run_v174_analysis(df):
     df['last_swing_high'] = last_sh
     df['last_swing_low'] = last_sl
 
-    # FVG / OB Lifecycle with Cascade Protection
     p5_records = []
     active_fvgs = []
     active_obs = []
@@ -352,7 +379,7 @@ def save_to_db(df, p5_records):
     conn.close()
 
 # ==========================================
-# 4. REDESIGNED SCORING & RISK ENGINE (V1.7.4)
+# 5. RISK ENGINE & SIGNAL RADAR V1.7.5
 # ==========================================
 def get_latest_record(table, symbol, tf):
     allowed_tables = {'analysis', 'phase5_features', 'signals'}
@@ -364,18 +391,12 @@ def get_latest_record(table, symbol, tf):
     return df.iloc[0] if not df.empty else None
 
 def get_active_phase5_confluence(symbol, tf):
-    """ Scans recent historical rows to find any currently active (FRESH) FVG/OB """
     conn = get_db_connection()
-    query = """
-        SELECT * FROM phase5_features 
-        WHERE symbol = ? AND timeframe = ? 
-        ORDER BY timestamp DESC LIMIT 30
-    """
+    query = "SELECT * FROM phase5_features WHERE symbol = ? AND timeframe = ? ORDER BY timestamp DESC LIMIT 30"
     df = pd.read_sql_query(query, conn, params=(symbol, tf))
     conn.close()
     if df.empty: return 0
     
-    # Check if there's any active FVG or OB in recent history
     fresh_fvg = any(df['fvg_status'] == 'FRESH')
     fresh_ob = any(df['ob_status'] == 'FRESH')
     recent_sweep = any(df['liquidity_swept'] == 1)
@@ -387,11 +408,10 @@ def get_active_phase5_confluence(symbol, tf):
     if recent_sweep and fresh_fvg and fresh_ob: score += 1
     return min(score, 5)
 
-def calculate_risk_metrics_v174(m15_row, direction):
-    """ ATR-buffered structural Risk/Reward Calculator """
+def calculate_risk_metrics_v175(m15_row, direction):
     close = m15_row['close']
     atr = m15_row['atr_14'] if pd.notna(m15_row['atr_14']) else (close * 0.01)
-    buffer = atr * 0.15 # ATR Buffer to avoid wick-hunts
+    buffer = atr * 0.15
     
     if direction == 'BULLISH':
         swing_low = m15_row['last_swing_low'] if pd.notna(m15_row['last_swing_low']) else (close - (atr * 1.5))
@@ -431,21 +451,14 @@ def save_signal_to_db(sig):
     conn.close()
 
 def check_5m_trigger_persistence(symbol):
-    """ Lookback across the last 3 closed 5M candles for a BOS/CHOCH event """
     conn = get_db_connection()
-    query = """
-        SELECT structure_event FROM analysis 
-        WHERE symbol = ? AND timeframe = '5m' 
-        ORDER BY timestamp DESC LIMIT 3
-    """
+    query = "SELECT structure_event FROM analysis WHERE symbol = ? AND timeframe = '5m' ORDER BY timestamp DESC LIMIT 3"
     df = pd.read_sql_query(query, conn, params=(symbol,))
     conn.close()
     if df.empty: return False
-    
-    events = df['structure_event'].tolist()
-    return any(ev in ['BOS_BULLISH', 'CHOCH_BULLISH', 'BOS_BEARISH', 'CHOCH_BEARISH'] for ev in events)
+    return any(ev in ['BOS_BULLISH', 'CHOCH_BULLISH', 'BOS_BEARISH', 'CHOCH_BEARISH'] for ev in df['structure_event'].tolist())
 
-def generate_v174_signal(symbol):
+def generate_v175_signal(symbol):
     d1 = get_latest_record('analysis', symbol, '1d')
     h4 = get_latest_record('analysis', symbol, '4h')
     h1 = get_latest_record('analysis', symbol, '1h')
@@ -454,37 +467,28 @@ def generate_v174_signal(symbol):
     if any(x is None for x in [d1, h4, h1, m15]):
         return None
         
-    # Hard Requirement 1: Macro Alignment (30 Pts)
     if d1['structure_state'] == h4['structure_state'] and d1['structure_state'] != 'NEUTRAL':
         macro_direction = d1['structure_state']
     else:
         return {"direction": "⚪ NO TRADE", "reason": "1D & 4H Macro Structure Conflict", "status": "INVALID"}
 
-    # Hard Requirement 2: 15M Direction Match
     if m15['structure_state'] != macro_direction:
         return {"direction": "⚪ NO TRADE", "reason": f"15M Counter-Trend ({m15['structure_state']})", "status": "INVALID"}
 
-    score = 30  # Macro base points
-    mtf_count = 2
-    
-    # HTF Alignment (15 Pts)
+    score, mtf_count = 30, 2
     if h1['structure_state'] == macro_direction: score += 15; mtf_count += 1
     
-    # 15M Structure Event (15 Pts)
     event_quality = "Structure Aligned"
     if m15['structure_event'] in ['BOS_BULLISH', 'CHOCH_BULLISH', 'BOS_BEARISH', 'CHOCH_BEARISH']:
         score += 15; event_quality = "Active Breakout Event"
 
-    # Liquidity Sweep & Confluence (Phase 5 - Up to 10 Pts)
     p5_score = get_active_phase5_confluence(symbol, '15m')
-    score += (p5_score * 2) # Scaled to balance the 100-pt model cleanly
+    score += (p5_score * 2)
 
-    # Momentum (RSI - 10 Pts)
     rsi = m15['rsi_14']
     mom_qual = "Healthy" if pd.notna(rsi) and ((macro_direction == 'BULLISH' and 45 <= rsi <= 70) or (macro_direction == 'BEARISH' and 30 <= rsi <= 55)) else "Neutral"
     if mom_qual == "Healthy": score += 10
             
-    # Volume Quality (10 Pts)
     vol_qual = "Average"
     if pd.notna(m15['volume']) and pd.notna(m15['vol_sma_20']) and m15['vol_sma_20'] > 0:
         v_ratio = m15['volume'] / m15['vol_sma_20']
@@ -492,7 +496,6 @@ def generate_v174_signal(symbol):
         elif v_ratio >= 1.20: score += 7; vol_qual = "Strong"
         elif v_ratio >= 0.90: score += 4; vol_qual = "Average"
 
-    # 5M Persistent Trigger Layer
     is_triggered = check_5m_trigger_persistence(symbol)
 
     grade, status = "🔴 NO TRADE", "WAITING TRIGGER"
@@ -503,7 +506,7 @@ def generate_v174_signal(symbol):
     if is_triggered and score >= 70: status = "✅ VALID TRIGGER"
     else: status = "⏳ WAITING FOR 5M TRIGGER"
 
-    ep, sl, tp1, tp2, rr = calculate_risk_metrics_v174(m15, macro_direction)
+    ep, sl, tp1, tp2, rr = calculate_risk_metrics_v175(m15, macro_direction)
 
     sig_payload = {
         "symbol": symbol, "timeframe": "15m", "timestamp": m15['timestamp'], "direction": macro_direction,
@@ -520,10 +523,10 @@ def generate_v174_signal(symbol):
     return sig_payload
 
 # ==========================================
-# 5. STREAMLIT UI - DASHBOARD V1.7.4
+# 6. STREAMLIT UI - DASHBOARD V1.7.5
 # ==========================================
-st.title("🚀 COSMIC 108 | V1.7.4 Institutional Radar")
-st.markdown("**Persistent Active FVG/OB Scans • 5M Lookback Triggers • ATR-Buffered Risk Management**")
+st.title("🚀 COSMIC 108 | V1.7.5 Zero-Dependency Radar")
+st.markdown("**Native Pandas Technical Engine • Active FVG/OB Confluence • ATR Risk Engine**")
 
 col_btn1, col_btn2 = st.columns(2)
 with col_btn1:
@@ -536,23 +539,23 @@ with col_btn1:
         st.success(f"Successfully ingested {cnt} new candles.")
         
 with col_btn2:
-    if st.button("🧠 STEP 2: RUN V1.7.4 INSTITUTIONAL PIPELINE", type="primary", use_container_width=True):
-        with st.spinner("Executing Causal Swings, Active Confluence & Risk Engine..."):
+    if st.button("🧠 STEP 2: RUN V1.7.5 INSTITUTIONAL PIPELINE", type="primary", use_container_width=True):
+        with st.spinner("Executing Native Indicators, Causal Swings & Risk Engine..."):
             for coin in TARGET_COINS:
                 for tf in TIMEFRAMES:
                     raw_df = load_raw_candles(coin, tf)
-                    analyzed_df, p5_records = run_v174_analysis(raw_df)
+                    analyzed_df, p5_records = run_v175_analysis(raw_df)
                     save_to_db(analyzed_df, p5_records)
-            st.success("✅ V1.7.4 Pipeline Executed Successfully!")
+            st.success("✅ V1.7.5 Pipeline Executed Successfully!")
 
 st.divider()
 
-selected_signal_coin = st.selectbox("Select Asset for V1.7.4 Signal Card", TARGET_COINS)
-signal_data = generate_v174_signal(selected_signal_coin)
+selected_signal_coin = st.selectbox("Select Asset for V1.7.5 Signal Card", TARGET_COINS)
+signal_data = generate_v175_signal(selected_signal_coin)
 
 if signal_data:
     with st.container(border=True):
-        st.markdown(f"### 🛡️ {selected_signal_coin} | Institutional Signal Card (V1.7.4)")
+        st.markdown(f"### 🛡️ {selected_signal_coin} | Institutional Signal Card (V1.7.5)")
         
         if signal_data['direction'] == '⚪ NO TRADE':
             st.error(f"**⚪ NO TRADE**")
