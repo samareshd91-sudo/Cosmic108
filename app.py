@@ -9,7 +9,7 @@ import time
 
 # ==========================================
 # 🚀 COSMIC 108 — SMART MARKET RADAR V1.7.5
-# Zero External Dependency Edition (No pandas-ta)
+# Zero External Dependency & Lifecycle-Safe Edition
 # ==========================================
 
 st.set_page_config(page_title="COSMIC 108 | Institutional Radar V1.7.5", layout="wide")
@@ -23,7 +23,6 @@ ANALYSIS_VERSION = "V1.7.5_PROD"
 # 1. PURE PANDAS TECHNICAL INDICATORS (No pandas-ta)
 # ==========================================
 def calculate_indicators(df):
-    """ Pure Pandas/Numpy implementations for EMA, RSI, ATR, SMA to avoid build errors """
     df = df.copy()
     close = df['close']
     high = df['high']
@@ -193,7 +192,6 @@ def run_v175_analysis(df):
         return df, []
     df = df.copy()
     
-    # Calculate Indicators via pure pandas
     df = calculate_indicators(df)
     
     df['ema_bias'] = np.where(pd.notna(df['ema_200']) & (df['close'] > df['ema_200']), 'Bullish',
@@ -368,7 +366,7 @@ def save_to_db(df, p5_records):
                       fvg_type, fvg_high, fvg_low, fvg_status,
                       ob_type, ob_high, ob_low, ob_status, phase5_score, phase5_confluence,
                       analysis_version, calc_timestamp)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                   (rec['symbol'], rec['timeframe'], rec['timestamp'].isoformat(),
                    rec['liquidity_type'], rec['liquidity_level'], rec['liquidity_swept'],
                    rec['fvg_type'], rec['fvg_high'], rec['fvg_low'], rec['fvg_status'],
