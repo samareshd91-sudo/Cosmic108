@@ -4,4 +4,3 @@ numpy
 ccxt
 requests
 plotly
-pandas-ta
