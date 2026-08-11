@@ -1,7 +1,6 @@
-​streamlit
+streamlit
 pandas
 pandas-ta
 numpy
 ccxt
 plotly
-sqlite3
