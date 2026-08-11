@@ -1,584 +1,3958 @@
-import streamlit as st
+import time
+import requests
 import pandas as pd
 import numpy as np
-import ccxt
-import sqlite3
-import os
-from datetime import datetime, timedelta, timezone
-import time
 
-# ==========================================
-# 🚀 COSMIC 108 — SMART MARKET RADAR V1.7.5
-# Zero External Dependency & Lifecycle-Safe Edition
-# ==========================================
+from datetime import datetime, timezone
+from collections import deque
 
-st.set_page_config(page_title="COSMIC 108 | Institutional Radar V1.7.5", layout="wide")
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
 
-DB_FILE = "cosmic108.db"
-TARGET_COINS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT"]
-TIMEFRAMES = ["1d", "4h", "1h", "15m", "5m"]
-ANALYSIS_VERSION = "V1.7.5_PROD"
+console = Console()
 
-# ==========================================
-# 1. PURE PANDAS TECHNICAL INDICATORS (No pandas-ta)
-# ==========================================
-def calculate_indicators(df):
-    df = df.copy()
-    close = df['close']
-    high = df['high']
-    low = df['low']
-    volume = df['volume']
-    
-    # EMA 50 & 200
-    df['ema_50'] = close.ewm(span=50, adjust=False).mean()
-    df['ema_200'] = close.ewm(span=200, adjust=False).mean() if len(df) >= 200 else np.nan
-    
-    # RSI 14
-    delta = close.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['rsi_14'] = 100 - (100 / (1 + rs))
-    
-    # ATR 14
-    tr1 = high - low
-    tr2 = abs(high - close.shift())
-    tr3 = abs(low - close.shift())
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    df['atr_14'] = tr.rolling(window=14).mean()
-    
-    # Volume SMA 20
-    df['vol_sma_20'] = volume.rolling(window=20).mean()
-    
-    return df
 
-# ==========================================
-# 2. SMART SQLITE & SCHEMA
-# ==========================================
-def get_db_connection():
-    conn = sqlite3.connect(DB_FILE, timeout=30.0, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=30000;")
-    return conn
+# ============================================================
+# COSMIC 108 V3.0
+# PART 1/5 — FOUNDATION + LIVE DATA + DATA QUALITY
+# ============================================================
 
-def init_db():
-    conn = get_db_connection()
-    c = conn.cursor()
-    
-    c.execute('''CREATE TABLE IF NOT EXISTS candles (
-                    symbol TEXT, timeframe TEXT, timestamp DATETIME,
-                    open REAL, high REAL, low REAL, close REAL, volume REAL,
-                    UNIQUE(symbol, timeframe, timestamp)
-                 )''')
-                 
-    c.execute('''CREATE TABLE IF NOT EXISTS analysis (
-                    symbol TEXT, timeframe TEXT, timestamp DATETIME,
-                    open REAL, high REAL, low REAL, close REAL, volume REAL,
-                    ema_50 REAL, ema_200 REAL, rsi_14 REAL, atr_14 REAL, vol_sma_20 REAL,
-                    ema_bias TEXT, structure_state TEXT, structure_event TEXT,
-                    break_distance REAL, last_swing_high REAL, last_swing_low REAL,
-                    analysis_version TEXT, calc_timestamp DATETIME,
-                    UNIQUE(symbol, timeframe, timestamp)
-                 )''')
-                 
-    c.execute('''CREATE TABLE IF NOT EXISTS phase5_features (
-                    symbol TEXT, timeframe TEXT, timestamp DATETIME,
-                    liquidity_type TEXT, liquidity_level REAL, liquidity_swept INTEGER,
-                    fvg_type TEXT, fvg_high REAL, fvg_low REAL, fvg_status TEXT,
-                    ob_type TEXT, ob_high REAL, ob_low REAL, ob_status TEXT,
-                    phase5_score INTEGER, phase5_confluence INTEGER,
-                    analysis_version TEXT, calc_timestamp DATETIME,
-                    UNIQUE(symbol, timeframe, timestamp)
-                 )''')
-                 
-    c.execute('''CREATE TABLE IF NOT EXISTS signals (
-                    symbol TEXT, timeframe TEXT, timestamp DATETIME, direction TEXT,
-                    score INTEGER, grade TEXT, macro_bias TEXT, htf_bias TEXT,
-                    ltf_bias TEXT, mtf_alignment TEXT, bos_choch TEXT,
-                    phase5_score INTEGER, momentum TEXT, volatility TEXT,
-                    volume_quality TEXT, entry_price REAL, stop_loss REAL,
-                    take_profit_1 REAL, take_profit_2 REAL, risk_reward REAL,
-                    trigger INTEGER, signal_status TEXT, 
-                    analysis_version TEXT, created_at DATETIME,
-                    UNIQUE(symbol, timeframe, timestamp)
-                 )''')
-    conn.commit()
-    conn.close()
+APP_NAME = "COSMIC 108 V3.0"
+VERSION = "3.0"
 
-init_db()
+# ------------------------------------------------------------
+# GLOBAL CONFIGURATION
+# ------------------------------------------------------------
 
-# ==========================================
-# 3. LIVE CCXT INGESTION ENGINE
-# ==========================================
-@st.cache_resource
-def get_exchange_instance():
-    return ccxt.kucoin({'enableRateLimit': True})
+CONFIG = {
+    "exchange": "KUCOIN",
 
-def fetch_and_store_live_candles(progress_bar, status_text):
-    exchange = get_exchange_instance()
-    conn = get_db_connection()
-    c = conn.cursor()
-    
-    total_tasks = len(TARGET_COINS) * len(TIMEFRAMES)
-    task_count = 0
-    new_candles_count = 0
-    
-    for coin in TARGET_COINS:
-        for tf in TIMEFRAMES:
-            task_count += 1
-            status_text.text(f"Ingesting: {coin} [{tf}] ({task_count}/{total_tasks})")
-            progress_bar.progress(task_count / total_tasks)
-            
+    # Symbols to scan
+    "symbols": [
+        "SOL-USDT",
+        "ETH-USDT",
+        "BNB-USDT",
+        "XRP-USDT",
+    ],
+
+    # Timeframes
+    "htf_1d": "1day",
+    "htf_4h": "4hour",
+    "htf_1h": "1hour",
+    "poi_tf": "15min",
+    "entry_tf": "5min",
+
+    # Candle history
+    "history_1d": 100,
+    "history_4h": 150,
+    "history_1h": 150,
+    "history_15m": 200,
+    "history_5m": 250,
+
+    # Live refresh
+    "refresh_seconds": 30,
+
+    # Data protection
+    "request_timeout": 8,
+    "max_retries": 3,
+
+    # SMC
+    "swing_window": 3,
+
+    # Setup expiry
+    "sweep_expiry": 6,
+    "mss_expiry": 4,
+    "displacement_expiry": 3,
+    "bos_expiry": 3,
+
+    # POI
+    "poi_proximity_percent": 1.5,
+
+    # Risk
+    "account_risk_usd": 10.0,
+
+    # Execution assumptions
+    "maker_fee": 0.0006,
+    "taker_fee": 0.0008,
+    "slippage": 0.0005,
+
+    # Signal protection
+    "cooldown_seconds": 1800,
+    "max_audit_records": 50,
+}
+
+
+# ============================================================
+# KUCOIN LIVE DATA FETCHER
+# ============================================================
+
+class KuCoinLive:
+
+    BASE_URL = "https://api.kucoin.com"
+
+    @staticmethod
+    def get_klines(
+        symbol: str,
+        interval: str,
+        limit: int = 100
+    ) -> pd.DataFrame:
+
+        endpoint = (
+            f"{KuCoinLive.BASE_URL}"
+            f"/api/v1/market/candles"
+        )
+
+        params = {
+            "symbol": symbol,
+            "type": interval
+        }
+
+        last_error = None
+
+        for attempt in range(
+            1,
+            CONFIG["max_retries"] + 1
+        ):
+
             try:
-                c.execute("SELECT MAX(timestamp) FROM candles WHERE symbol = ? AND timeframe = ?", (coin, tf))
-                last_ts_str = c.fetchone()[0]
-                
-                since = None
-                limit = 400
-                if last_ts_str:
-                    last_dt = datetime.fromisoformat(last_ts_str)
-                    since = int(last_dt.timestamp() * 1000) + 1
-                    limit = 100
-                
-                ohlcv = exchange.fetch_ohlcv(coin, tf, since=since, limit=limit)
-                
-                for row in ohlcv:
-                    timestamp = datetime.fromtimestamp(row[0] / 1000, tz=timezone.utc).isoformat()
-                    c.execute("""INSERT OR IGNORE INTO candles 
-                                 (symbol, timeframe, timestamp, open, high, low, close, volume) 
-                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", 
-                              (coin, tf, timestamp, row[1], row[2], row[3], row[4], row[5]))
-                    if c.rowcount > 0:
-                        new_candles_count += 1
-                conn.commit()
-            except Exception as e:
-                print(f"[Ingestion Error] {coin} {tf}: {e}")
-                time.sleep(1)
-                
-    conn.close()
-    return new_candles_count
 
-def tf_to_seconds(tf):
-    units = {'m': 60, 'h': 3600, 'd': 86400}
-    return int(tf[:-1]) * units[tf[-1]]
+                response = requests.get(
+                    endpoint,
+                    params=params,
+                    timeout=CONFIG["request_timeout"]
+                )
 
-def filter_closed_candles(df, tf):
-    if df.empty: return df
-    tf_secs = tf_to_seconds(tf)
-    current_utc = datetime.now(timezone.utc)
-    df['close_time'] = df['timestamp'] + pd.to_timedelta(tf_secs, unit='s')
-    return df[df['close_time'] <= current_utc].drop(columns=['close_time']).copy()
+                response.raise_for_status()
 
-def load_raw_candles(symbol, timeframe, limit=500):
-    conn = get_db_connection()
-    query = """
-        SELECT * FROM (
-            SELECT * FROM candles 
-            WHERE symbol = ? AND timeframe = ? 
-            ORDER BY timestamp DESC LIMIT ?
-        ) ORDER BY timestamp ASC
-    """
-    df = pd.read_sql_query(query, conn, params=(symbol, timeframe, limit))
-    conn.close()
-    if not df.empty:
-        df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
-    return filter_closed_candles(df, timeframe)
+                payload = response.json()
 
-# ==========================================
-# 4. ANALYSIS & PIPELINE ENGINE V1.7.5
-# ==========================================
-def run_v175_analysis(df):
-    if df.empty or len(df) < 50:
-        return df, []
-    df = df.copy()
-    
-    df = calculate_indicators(df)
-    
-    df['ema_bias'] = np.where(pd.notna(df['ema_200']) & (df['close'] > df['ema_200']), 'Bullish',
-                     np.where(pd.notna(df['ema_200']) & (df['close'] < df['ema_200']), 'Bearish', 'Neutral'))
-    
-    df['rolling_max'] = df['high'].rolling(window=5, center=True).max()
-    df['rolling_min'] = df['low'].rolling(window=5, center=True).min()
-    df['swing_high'] = np.where(df['high'] == df['rolling_max'], df['high'], np.nan)
-    df['swing_low'] = np.where(df['low'] == df['rolling_min'], df['low'], np.nan)
-    df['swing_high'] = df['swing_high'].shift(2)
-    df['swing_low'] = df['swing_low'].shift(2)
-    
-    states, events, break_dists, last_sh, last_sl = [], [], [], [], []
-    current_state = 'NEUTRAL'
-    current_sh, current_sl = np.nan, np.nan
+                data = payload.get("data", [])
 
-    for row in df.itertuples():
-        event = 'NONE'
-        brk_dist = 0.0
-        
-        if pd.notna(row.swing_high): current_sh = row.swing_high
-        if pd.notna(row.swing_low): current_sl = row.swing_low
-        
-        range_size = row.high - row.low
-        body_size = abs(row.close - row.open)
-        body_ratio = body_size / range_size if range_size > 0 else 0
-        close_pos = (row.close - row.low) / range_size if range_size > 0 else 0
-        atr_buffer = (row.atr_14 * 0.15) if pd.notna(row.atr_14) else 0.0
-        
-        if pd.notna(current_sh) and row.close > current_sh:
-            dist = row.close - current_sh
-            min_dist = min(max(current_sh * 0.001, atr_buffer), current_sh * 0.005)
-            if dist >= min_dist and body_ratio >= 0.55 and close_pos >= 0.70:
-                event = 'BOS_BULLISH' if current_state in ['BULLISH', 'NEUTRAL'] else 'CHOCH_BULLISH'
-                current_state = 'BULLISH'
-                brk_dist = dist / current_sh
-                current_sh = np.nan
-                
-        elif pd.notna(current_sl) and row.close < current_sl:
-            dist = current_sl - row.close
-            min_dist = min(max(current_sl * 0.001, atr_buffer), current_sl * 0.005)
-            if dist >= min_dist and body_ratio >= 0.55 and close_pos <= 0.30:
-                event = 'BOS_BEARISH' if current_state in ['BEARISH', 'NEUTRAL'] else 'CHOCH_BEARISH'
-                current_state = 'BEARISH'
-                brk_dist = dist / current_sl
-                current_sl = np.nan
+                if not data:
+                    return pd.DataFrame()
 
-        states.append(current_state)
-        events.append(event)
-        break_dists.append(brk_dist)
-        last_sh.append(current_sh)
-        last_sl.append(current_sl)
+                # KuCoin candle format:
+                #
+                # [
+                #   timestamp,
+                #   open,
+                #   close,
+                #   high,
+                #   low,
+                #   volume,
+                #   turnover
+                # ]
 
-    df['structure_state'] = states
-    df['structure_event'] = events
-    df['break_distance'] = break_dists
-    df['last_swing_high'] = last_sh
-    df['last_swing_low'] = last_sl
+                columns = [
+                    "timestamp",
+                    "open",
+                    "close",
+                    "high",
+                    "low",
+                    "volume",
+                    "turnover"
+                ]
 
-    p5_records = []
-    active_fvgs = []
-    active_obs = []
-    
-    for i in range(len(df)):
-        row = df.iloc[i]
-        p5_records.append({
-            "symbol": row['symbol'], "timeframe": row['timeframe'], "timestamp": row['timestamp'],
-            "liquidity_type": 'NONE', "liquidity_level": np.nan, "liquidity_swept": 0,
-            "fvg_type": 'NONE', "fvg_high": np.nan, "fvg_low": np.nan, "fvg_status": 'NONE',
-            "ob_type": 'NONE', "ob_high": np.nan, "ob_low": np.nan, "ob_status": 'NONE',
-            "phase5_score": 0, "phase5_confluence": 0
+                df = pd.DataFrame(
+                    data,
+                    columns=columns
+                )
+
+                df = df[
+                    [
+                        "timestamp",
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                        "volume"
+                    ]
+                ]
+
+                numeric_columns = [
+                    "timestamp",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume"
+                ]
+
+                for column in numeric_columns:
+                    df[column] = pd.to_numeric(
+                        df[column],
+                        errors="coerce"
+                    )
+
+                df = df.dropna()
+
+                df["timestamp"] = (
+                    df["timestamp"]
+                    .astype(np.int64)
+                )
+
+                # KuCoin returns candles in reverse order
+                # so always sort chronologically.
+                df = df.sort_values(
+                    "timestamp"
+                ).reset_index(drop=True)
+
+                # Remove duplicate timestamps.
+                df = df.drop_duplicates(
+                    subset=["timestamp"],
+                    keep="last"
+                ).reset_index(drop=True)
+
+                return df.tail(limit).reset_index(
+                    drop=True
+                )
+
+            except Exception as exc:
+
+                last_error = exc
+
+                if attempt < CONFIG["max_retries"]:
+                    time.sleep(1)
+
+        console.print(
+            f"[red]KuCoin API Error "
+            f"{symbol} {interval}: "
+            f"{last_error}[/red]"
+        )
+
+        return pd.DataFrame()
+
+
+# ============================================================
+# DATA QUALITY GUARD
+# ============================================================
+
+class DataQualityGuard:
+
+    TIMEFRAME_SECONDS = {
+        "1min": 60,
+        "5min": 300,
+        "15min": 900,
+        "1hour": 3600,
+        "4hour": 14400,
+        "1day": 86400,
+    }
+
+    @staticmethod
+    def validate(
+        df: pd.DataFrame,
+        interval: str,
+        minimum_candles: int = 50
+    ):
+
+        if df is None or df.empty:
+
+            return (
+                False,
+                "CRITICAL: Empty market data"
+            )
+
+        if len(df) < minimum_candles:
+
+            return (
+                False,
+                f"CRITICAL: Only {len(df)} candles available"
+            )
+
+        required_columns = [
+            "timestamp",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume"
+        ]
+
+        for column in required_columns:
+
+            if column not in df.columns:
+
+                return (
+                    False,
+                    f"CRITICAL: Missing column {column}"
+                )
+
+        # ----------------------------------------------------
+        # Duplicate candle protection
+        # ----------------------------------------------------
+
+        if df["timestamp"].duplicated().any():
+
+            return (
+                False,
+                "ERROR: Duplicate timestamps detected"
+            )
+
+        # ----------------------------------------------------
+        # Timestamp ordering
+        # ----------------------------------------------------
+
+        if not df["timestamp"].is_monotonic_increasing:
+
+            return (
+                False,
+                "ERROR: Candle timestamps not chronological"
+            )
+
+        # ----------------------------------------------------
+        # Gap detection
+        # ----------------------------------------------------
+
+        expected = (
+            DataQualityGuard
+            .TIMEFRAME_SECONDS
+            .get(interval)
+        )
+
+        if expected is not None:
+
+            differences = (
+                df["timestamp"]
+                .diff()
+                .dropna()
+            )
+
+            max_gap = expected * 1.5
+
+            if (differences > max_gap).any():
+
+                return (
+                    False,
+                    "WARNING: Candle gap detected"
+                )
+
+        # ----------------------------------------------------
+        # OHLC sanity checks
+        # ----------------------------------------------------
+
+        invalid_ohlc = (
+            (df["high"] < df["low"]) |
+            (df["high"] < df["open"]) |
+            (df["high"] < df["close"]) |
+            (df["low"] > df["open"]) |
+            (df["low"] > df["close"])
+        )
+
+        if invalid_ohlc.any():
+
+            return (
+                False,
+                "ERROR: Invalid OHLC structure"
+            )
+
+        # ----------------------------------------------------
+        # Negative / zero price protection
+        # ----------------------------------------------------
+
+        if (
+            (df["open"] <= 0).any() or
+            (df["high"] <= 0).any() or
+            (df["low"] <= 0).any() or
+            (df["close"] <= 0).any()
+        ):
+
+            return (
+                False,
+                "ERROR: Invalid price detected"
+            )
+
+        # ----------------------------------------------------
+        # Volume protection
+        # ----------------------------------------------------
+
+        if (df["volume"] < 0).any():
+
+            return (
+                False,
+                "ERROR: Negative volume detected"
+            )
+
+        zero_volume_count = (
+            df["volume"] == 0
+        ).sum()
+
+        if zero_volume_count > 3:
+
+            return (
+                False,
+                "WARNING: Excessive zero-volume candles"
+            )
+
+        # ----------------------------------------------------
+        # NaN protection
+        # ----------------------------------------------------
+
+        if df[required_columns].isna().any().any():
+
+            return (
+                False,
+                "ERROR: NaN values detected"
+            )
+
+        return True, "DATA OK"
+
+
+# ============================================================
+# STALE DATA PROTECTION
+# ============================================================
+
+class StaleDataGuard:
+
+    @staticmethod
+    def is_stale(
+        df: pd.DataFrame,
+        interval: str,
+        tolerance_multiplier: float = 2.0
+    ):
+
+        if df is None or df.empty:
+            return True
+
+        timeframe_seconds = (
+            DataQualityGuard
+            .TIMEFRAME_SECONDS
+            .get(interval)
+        )
+
+        if timeframe_seconds is None:
+            return False
+
+        latest_timestamp = int(
+            df["timestamp"].iloc[-1]
+        )
+
+        now_timestamp = int(
+            datetime.now(
+                timezone.utc
+            ).timestamp()
+        )
+
+        age = (
+            now_timestamp -
+            latest_timestamp
+        )
+
+        allowed_age = (
+            timeframe_seconds *
+            tolerance_multiplier
+        )
+
+        return age > allowed_age
+
+
+# ============================================================
+# MARKET DATA BUNDLE
+# ============================================================
+
+class MarketData:
+
+    def __init__(self, symbol: str):
+
+        self.symbol = symbol
+
+        self.data = {
+            "1d": pd.DataFrame(),
+            "4h": pd.DataFrame(),
+            "1h": pd.DataFrame(),
+            "15m": pd.DataFrame(),
+            "5m": pd.DataFrame(),
+        }
+
+        self.errors = []
+
+    def fetch_all(self):
+
+        self.errors = []
+
+        requests_map = {
+            "1d": (
+                CONFIG["htf_1d"],
+                CONFIG["history_1d"]
+            ),
+            "4h": (
+                CONFIG["htf_4h"],
+                CONFIG["history_4h"]
+            ),
+            "1h": (
+                CONFIG["htf_1h"],
+                CONFIG["history_1h"]
+            ),
+            "15m": (
+                CONFIG["poi_tf"],
+                CONFIG["history_15m"]
+            ),
+            "5m": (
+                CONFIG["entry_tf"],
+                CONFIG["history_5m"]
+            ),
+        }
+
+        for key, (interval, limit) in requests_map.items():
+
+            df = KuCoinLive.get_klines(
+                self.symbol,
+                interval,
+                limit
+            )
+
+            valid, message = (
+                DataQualityGuard.validate(
+                    df,
+                    interval
+                )
+            )
+
+            if not valid:
+
+                self.errors.append(
+                    f"{key}: {message}"
+                )
+
+                self.data[key] = pd.DataFrame()
+
+                continue
+
+            if StaleDataGuard.is_stale(
+                df,
+                interval
+            ):
+
+                self.errors.append(
+                    f"{key}: STALE DATA"
+                )
+
+                self.data[key] = pd.DataFrame()
+
+                continue
+
+            self.data[key] = df
+
+        return self.data
+
+    def is_ready(self):
+
+        required = [
+            "1d",
+            "4h",
+            "1h",
+            "15m",
+            "5m"
+        ]
+
+        return all(
+            not self.data[key].empty
+            for key in required
+        )
+
+
+# ============================================================
+# SIMPLE AUDIT LOGGER
+# ============================================================
+
+class AuditLogger:
+
+    def __init__(self, max_records=None):
+
+        if max_records is None:
+            max_records = CONFIG[
+                "max_audit_records"
+            ]
+
+        self.records = deque(
+            maxlen=max_records
+        )
+
+    def log(
+        self,
+        symbol: str,
+        event: str,
+        message: str,
+        score: int = 0
+    ):
+
+        self.records.appendleft({
+
+            "time": datetime.now(
+                timezone.utc
+            ).strftime("%H:%M:%S"),
+
+            "symbol": symbol,
+
+            "event": event,
+
+            "score": score,
+
+            "message": message
         })
 
-    hist_sh = df['last_swing_high'].shift(1)
-    hist_sl = df['last_swing_low'].shift(1)
+    def latest(self, limit=10):
 
-    for i in range(2, len(df)):
-        row = df.iloc[i]
-        prev_sh = hist_sh.iloc[i]
-        prev_sl = hist_sl.iloc[i]
-        
-        liq_swept, liq_type, liq_lvl = 0, 'NONE', np.nan
-        if pd.notna(prev_sl) and row['low'] < prev_sl and row['close'] > prev_sl:
-            liq_swept, liq_type, liq_lvl = 1, 'BULLISH_SWEEP', prev_sl
-        elif pd.notna(prev_sh) and row['high'] > prev_sh and row['close'] < prev_sh:
-            liq_swept, liq_type, liq_lvl = 1, 'BEARISH_SWEEP', prev_sh
+        return list(
+            self.records
+        )[:limit]
 
-        p5_records[i]["liquidity_type"] = liq_type
-        p5_records[i]["liquidity_level"] = liq_lvl
-        p5_records[i]["liquidity_swept"] = liq_swept
 
-        for fvg in active_fvgs:
-            if fvg['status'] == 'FRESH':
-                old_status = fvg['status']
-                if fvg['type'] == 'BULLISH_FVG':
-                    if row['close'] < fvg['low']: fvg['status'] = 'INVALID'
-                    elif row['low'] <= fvg['high']: fvg['status'] = 'MITIGATED'
-                elif fvg['type'] == 'BEARISH_FVG':
-                    if row['close'] > fvg['high']: fvg['status'] = 'INVALID'
-                    elif row['high'] >= fvg['low']: fvg['status'] = 'MITIGATED'
-                
-                if fvg['status'] != old_status:
-                    p5_records[fvg['record_idx']]['fvg_status'] = fvg['status']
+# ============================================================
+# BASIC CONNECTION TEST
+# ============================================================
 
-        c1, c2, c3 = df.iloc[i-2], df.iloc[i-1], row
-        c2_ratio = abs(c2['close'] - c2['open']) / (c2['high'] - c2['low']) if (c2['high'] - c2['low']) > 0 else 0
-        atr = c3['atr_14'] if pd.notna(c3['atr_14']) else 0
-        
-        if c2_ratio >= 0.55:
-            if c3['low'] > c1['high'] and (c3['low'] - c1['high']) >= (0.5 * atr):
-                p5_records[i].update({"fvg_type": 'BULLISH_FVG', "fvg_high": c3['low'], "fvg_low": c1['high'], "fvg_status": 'FRESH'})
-                active_fvgs.append({'type': 'BULLISH_FVG', 'high': c3['low'], 'low': c1['high'], 'status': 'FRESH', 'record_idx': i})
-            elif c3['high'] < c1['low'] and (c1['low'] - c3['high']) >= (0.5 * atr):
-                p5_records[i].update({"fvg_type": 'BEARISH_FVG', "fvg_high": c1['low'], "fvg_low": c3['high'], "fvg_status": 'FRESH'})
-                active_fvgs.append({'type': 'BEARISH_FVG', 'high': c1['low'], 'low': c3['high'], 'status': 'FRESH', 'record_idx': i})
+def test_market_connection():
 
-        for ob in active_obs:
-            if ob['status'] == 'FRESH':
-                old_ob = ob['status']
-                if ob['type'] == 'BULLISH_OB' and row['low'] <= ob['low']: ob['status'] = 'INVALID'
-                elif ob['type'] == 'BEARISH_OB' and row['high'] >= ob['high']: ob['status'] = 'INVALID'
-                if ob['status'] != old_ob:
-                    p5_records[ob['record_idx']]['ob_status'] = ob['status']
+    console.print(
+        Panel(
+            "[bold cyan]"
+            f"{APP_NAME} {VERSION}"
+            "[/bold cyan]\n"
+            "Testing KuCoin public market connection..."
+        )
+    )
 
-        if row['structure_event'] in ['BOS_BULLISH', 'CHOCH_BULLISH']:
-            for j in range(i-1, max(0, i-6), -1):
-                if df.iloc[j]['close'] < df.iloc[j]['open']:
-                    p5_records[i].update({"ob_type": 'BULLISH_OB', "ob_high": df.iloc[j]['open'], "ob_low": df.iloc[j]['low'], "ob_status": 'FRESH'})
-                    active_obs.append({'type': 'BULLISH_OB', 'high': df.iloc[j]['open'], 'low': df.iloc[j]['low'], 'status': 'FRESH', 'record_idx': i})
-                    break
-        elif row['structure_event'] in ['BOS_BEARISH', 'CHOCH_BEARISH']:
-            for j in range(i-1, max(0, i-6), -1):
-                if df.iloc[j]['close'] > df.iloc[j]['open']:
-                    p5_records[i].update({"ob_type": 'BEARISH_OB', "ob_high": df.iloc[j]['high'], "ob_low": df.iloc[j]['close'], "ob_status": 'FRESH'})
-                    active_obs.append({'type': 'BEARISH_OB', 'high': df.iloc[j]['high'], 'low': df.iloc[j]['close'], 'status': 'FRESH', 'record_idx': i})
-                    break
+    df = KuCoinLive.get_klines(
+        "BTC-USDT",
+        "5min",
+        10
+    )
 
-    for rec in p5_records:
-        score = 0
-        if rec["liquidity_swept"] == 1: score += 2
-        if rec["fvg_status"] == 'FRESH': score += 1
-        if rec["ob_status"] == 'FRESH': score += 1
-        confluence = 1 if (rec["liquidity_swept"] == 1 and rec["fvg_status"] == 'FRESH' and rec["ob_status"] == 'FRESH') else 0
-        if confluence: score += 1
-        rec["phase5_score"] = min(score, 5)
-        rec["phase5_confluence"] = confluence
-        
-    return df, p5_records
+    if df.empty:
 
-def save_to_db(df, p5_records):
-    if df.empty: return
-    now_str = datetime.now(timezone.utc).isoformat()
-    conn = get_db_connection()
-    c = conn.cursor()
-    
-    for _, row in df.iterrows():
-        c.execute("""INSERT OR REPLACE INTO analysis 
-                     (symbol, timeframe, timestamp, open, high, low, close, volume,
-                      ema_50, ema_200, rsi_14, atr_14, vol_sma_20, ema_bias, 
-                      structure_state, structure_event, break_distance, last_swing_high, last_swing_low, 
-                      analysis_version, calc_timestamp)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                  (row['symbol'], row['timeframe'], row['timestamp'].isoformat(),
-                   row.get('open'), row.get('high'), row.get('low'), row.get('close'), row.get('volume'),
-                   row.get('ema_50'), row.get('ema_200'), row.get('rsi_14'), row.get('atr_14'), row.get('vol_sma_20'),
-                   row.get('ema_bias'), row.get('structure_state'), row.get('structure_event'), row.get('break_distance'),
-                   row.get('last_swing_high'), row.get('last_swing_low'), ANALYSIS_VERSION, now_str))
-                   
-    for rec in p5_records:
-        c.execute("""INSERT OR REPLACE INTO phase5_features 
-                     (symbol, timeframe, timestamp, liquidity_type, liquidity_level, liquidity_swept,
-                      fvg_type, fvg_high, fvg_low, fvg_status,
-                      ob_type, ob_high, ob_low, ob_status, phase5_score, phase5_confluence,
-                      analysis_version, calc_timestamp)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                  (rec['symbol'], rec['timeframe'], rec['timestamp'].isoformat(),
-                   rec['liquidity_type'], rec['liquidity_level'], rec['liquidity_swept'],
-                   rec['fvg_type'], rec['fvg_high'], rec['fvg_low'], rec['fvg_status'],
-                   rec['ob_type'], rec['ob_high'], rec['ob_low'], rec['ob_status'],
-                   rec['phase5_score'], rec['phase5_confluence'], ANALYSIS_VERSION, now_str))
-                   
-    conn.commit()
-    conn.close()
+        console.print(
+            "[bold red]"
+            "❌ KuCoin connection/data test failed"
+            "[/bold red]"
+        )
 
+        return False
+
+    console.print(
+        "[bold green]"
+        "✅ KuCoin live market connection OK"
+        "[/bold green]"
+    )
+
+    console.print(
+        f"BTC-USDT candles received: {len(df)}"
+    )
+
+    return True
+
+
+# ============================================================
+# PART 1 TEST
+# ============================================================
+
+if __name__ == "__main__":
+
+    test_market_connection()
 # ==========================================
-# 5. RISK ENGINE & SIGNAL RADAR V1.7.5
+# PART 2 — DATA QUALITY + SMC MATH ENGINE
 # ==========================================
-def get_latest_record(table, symbol, tf):
-    allowed_tables = {'analysis', 'phase5_features', 'signals'}
-    if table not in allowed_tables: raise ValueError(f"Unauthorized table: {table}")
-    conn = get_db_connection()
-    query = f"SELECT * FROM {table} WHERE symbol = ? AND timeframe = ? ORDER BY timestamp DESC LIMIT 1"
-    df = pd.read_sql_query(query, conn, params=(symbol, tf))
-    conn.close()
-    return df.iloc[0] if not df.empty else None
 
-def get_active_phase5_confluence(symbol, tf):
-    conn = get_db_connection()
-    query = "SELECT * FROM phase5_features WHERE symbol = ? AND timeframe = ? ORDER BY timestamp DESC LIMIT 30"
-    df = pd.read_sql_query(query, conn, params=(symbol, tf))
-    conn.close()
-    if df.empty: return 0
-    
-    fresh_fvg = any(df['fvg_status'] == 'FRESH')
-    fresh_ob = any(df['ob_status'] == 'FRESH')
-    recent_sweep = any(df['liquidity_swept'] == 1)
-    
-    score = 0
-    if recent_sweep: score += 2
-    if fresh_fvg: score += 1
-    if fresh_ob: score += 1
-    if recent_sweep and fresh_fvg and fresh_ob: score += 1
-    return min(score, 5)
+class DataQualityGuard:
 
-def calculate_risk_metrics_v175(m15_row, direction):
-    close = m15_row['close']
-    atr = m15_row['atr_14'] if pd.notna(m15_row['atr_14']) else (close * 0.01)
-    buffer = atr * 0.15
-    
-    if direction == 'BULLISH':
-        swing_low = m15_row['last_swing_low'] if pd.notna(m15_row['last_swing_low']) else (close - (atr * 1.5))
-        sl = swing_low - buffer
-        risk = close - sl
-        if risk <= 0: risk = atr * 1.5
-        tp1 = close + (risk * 1.5)
-        tp2 = close + (risk * 2.5)
-        rr = (tp1 - close) / risk
-    else:
-        swing_high = m15_row['last_swing_high'] if pd.notna(m15_row['last_swing_high']) else (close + (atr * 1.5))
-        sl = swing_high + buffer
-        risk = sl - close
-        if risk <= 0: risk = atr * 1.5
-        tp1 = close - (risk * 1.5)
-        tp2 = close - (risk * 2.5)
-        rr = (close - tp1) / risk
-        
-    return round(close, 2), round(sl, 2), round(tp1, 2), round(tp2, 2), round(rr, 2)
+    @staticmethod
+    def validate(df, timeframe_minutes=5, min_candles=50):
 
-def save_signal_to_db(sig):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("""INSERT OR REPLACE INTO signals 
-                 (symbol, timeframe, timestamp, direction, score, grade, macro_bias, htf_bias,
-                  ltf_bias, mtf_alignment, bos_choch, phase5_score, momentum, volatility,
-                  volume_quality, entry_price, stop_loss, take_profit_1, take_profit_2, risk_reward,
-                  trigger, signal_status, analysis_version, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-              (sig['symbol'], sig['timeframe'], sig['timestamp'], sig['direction'],
-               sig['score'], sig['grade'], sig['macro_bias'], sig['htf_bias'],
-               sig['ltf_bias'], sig['mtf_alignment'], sig['bos_choch'], sig['phase5_score'],
-               sig['momentum'], sig['volatility'], sig['volume_quality'], sig['entry_price'],
-               sig['stop_loss'], sig['take_profit_1'], sig['take_profit_2'], sig['risk_reward'],
-               sig['trigger'], sig['status'], ANALYSIS_VERSION, datetime.now(timezone.utc).isoformat()))
-    conn.commit()
-    conn.close()
+        if df is None or df.empty:
+            return False, "NO DATA"
 
-def check_5m_trigger_persistence(symbol):
-    conn = get_db_connection()
-    query = "SELECT structure_event FROM analysis WHERE symbol = ? AND timeframe = '5m' ORDER BY timestamp DESC LIMIT 3"
-    df = pd.read_sql_query(query, conn, params=(symbol,))
-    conn.close()
-    if df.empty: return False
-    return any(ev in ['BOS_BULLISH', 'CHOCH_BULLISH', 'BOS_BEARISH', 'CHOCH_BEARISH'] for ev in df['structure_event'].tolist())
+        if len(df) < min_candles:
+            return False, f"INSUFFICIENT DATA ({len(df)}/{min_candles})"
 
-def generate_v175_signal(symbol):
-    d1 = get_latest_record('analysis', symbol, '1d')
-    h4 = get_latest_record('analysis', symbol, '4h')
-    h1 = get_latest_record('analysis', symbol, '1h')
-    m15 = get_latest_record('analysis', symbol, '15m')
-    
-    if any(x is None for x in [d1, h4, h1, m15]):
-        return None
-        
-    if d1['structure_state'] == h4['structure_state'] and d1['structure_state'] != 'NEUTRAL':
-        macro_direction = d1['structure_state']
-    else:
-        return {"direction": "⚪ NO TRADE", "reason": "1D & 4H Macro Structure Conflict", "status": "INVALID"}
+        required = [
+            "timestamp",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume"
+        ]
 
-    if m15['structure_state'] != macro_direction:
-        return {"direction": "⚪ NO TRADE", "reason": f"15M Counter-Trend ({m15['structure_state']})", "status": "INVALID"}
+        for col in required:
+            if col not in df.columns:
+                return False, f"MISSING COLUMN: {col}"
 
-    score, mtf_count = 30, 2
-    if h1['structure_state'] == macro_direction: score += 15; mtf_count += 1
-    
-    event_quality = "Structure Aligned"
-    if m15['structure_event'] in ['BOS_BULLISH', 'CHOCH_BULLISH', 'BOS_BEARISH', 'CHOCH_BEARISH']:
-        score += 15; event_quality = "Active Breakout Event"
+        if df["timestamp"].duplicated().any():
+            return False, "DUPLICATE TIMESTAMP"
 
-    p5_score = get_active_phase5_confluence(symbol, '15m')
-    score += (p5_score * 2)
+        if df[["open", "high", "low", "close"]].isnull().any().any():
+            return False, "OHLC NULL DATA"
 
-    rsi = m15['rsi_14']
-    mom_qual = "Healthy" if pd.notna(rsi) and ((macro_direction == 'BULLISH' and 45 <= rsi <= 70) or (macro_direction == 'BEARISH' and 30 <= rsi <= 55)) else "Neutral"
-    if mom_qual == "Healthy": score += 10
-            
-    vol_qual = "Average"
-    if pd.notna(m15['volume']) and pd.notna(m15['vol_sma_20']) and m15['vol_sma_20'] > 0:
-        v_ratio = m15['volume'] / m15['vol_sma_20']
-        if v_ratio > 1.50: score += 10; vol_qual = "Massive Surge"
-        elif v_ratio >= 1.20: score += 7; vol_qual = "Strong"
-        elif v_ratio >= 0.90: score += 4; vol_qual = "Average"
+        if df["volume"].isnull().any():
+            return False, "VOLUME NULL DATA"
 
-    is_triggered = check_5m_trigger_persistence(symbol)
+        if (df["high"] < df["low"]).any():
+            return False, "INVALID HIGH/LOW"
 
-    grade, status = "🔴 NO TRADE", "WAITING TRIGGER"
-    if score >= 90: grade = "🔥 A+ SNIPER"
-    elif score >= 80: grade = "🟢 A SIGNAL"
-    elif score >= 70: grade = "🟡 B SIGNAL"
-    
-    if is_triggered and score >= 70: status = "✅ VALID TRIGGER"
-    else: status = "⏳ WAITING FOR 5M TRIGGER"
+        expected = timeframe_minutes * 60
 
-    ep, sl, tp1, tp2, rr = calculate_risk_metrics_v175(m15, macro_direction)
+        diffs = df["timestamp"].diff().dropna()
 
-    sig_payload = {
-        "symbol": symbol, "timeframe": "15m", "timestamp": m15['timestamp'], "direction": macro_direction,
-        "score": min(score, 100), "grade": grade, "macro_bias": d1['structure_state'],
-        "htf_bias": h4['structure_state'], "ltf_bias": m15['structure_state'],
-        "mtf_alignment": f"{mtf_count}/4", "bos_choch": event_quality,
-        "phase5_score": p5_score, "momentum": mom_qual, "volatility": "Healthy",
-        "volume_quality": vol_qual, "entry_price": ep, "stop_loss": sl,
-        "take_profit_1": tp1, "take_profit_2": tp2, "risk_reward": rr,
-        "trigger": 1 if is_triggered else 0, "status": status, "reason": "Passed All Strict Institutional Filters"
-    }
-    
-    save_signal_to_db(sig_payload)
-    return sig_payload
+        if (diffs > expected * 1.5).any():
+            return False, "CANDLE GAP DETECTED"
 
+        if (df["volume"] < 0).any():
+            return False, "INVALID VOLUME"
+
+        return True, "DATA OK"
+
+
+class SMCMath:
+
+    # --------------------------------------
+    # ATR
+    # --------------------------------------
+
+    @staticmethod
+    def calculate_atr(df, period=14):
+
+        previous_close = df["close"].shift(1)
+
+        tr1 = df["high"] - df["low"]
+        tr2 = (df["high"] - previous_close).abs()
+        tr3 = (df["low"] - previous_close).abs()
+
+        true_range = pd.concat(
+            [tr1, tr2, tr3],
+            axis=1
+        ).max(axis=1)
+
+        atr = true_range.rolling(
+            period,
+            min_periods=period
+        ).mean()
+
+        return atr
+
+
+    # --------------------------------------
+    # EMA
+    # --------------------------------------
+
+    @staticmethod
+    def ema(df, period):
+
+        return df["close"].ewm(
+            span=period,
+            adjust=False,
+            min_periods=period
+        ).mean()
+
+
+    # --------------------------------------
+    # Volume Expansion
+    # --------------------------------------
+
+    @staticmethod
+    def volume_expansion(df, idx, period=20, multiplier=1.5):
+
+        if idx < period:
+            return False
+
+        avg_volume = df["volume"].iloc[
+            idx - period:idx
+        ].mean()
+
+        if avg_volume <= 0:
+            return False
+
+        return (
+            df["volume"].iloc[idx]
+            >= avg_volume * multiplier
+        )
+
+
+    # --------------------------------------
+    # Displacement
+    # --------------------------------------
+
+    @staticmethod
+    def displacement(
+        df,
+        idx,
+        atr_multiplier=1.2,
+        volume_multiplier=1.5,
+        body_ratio_min=0.70
+    ):
+
+        if idx < 20:
+            return False
+
+        atr_series = SMCMath.calculate_atr(df)
+
+        atr = atr_series.iloc[idx]
+
+        if pd.isna(atr) or atr <= 0:
+            return False
+
+        candle_open = df["open"].iloc[idx]
+        candle_close = df["close"].iloc[idx]
+        candle_high = df["high"].iloc[idx]
+        candle_low = df["low"].iloc[idx]
+
+        body = abs(
+            candle_close - candle_open
+        )
+
+        candle_range = (
+            candle_high - candle_low
+        )
+
+        if candle_range <= 0:
+            return False
+
+        body_ratio = body / candle_range
+
+        volume_ok = SMCMath.volume_expansion(
+            df,
+            idx,
+            20,
+            volume_multiplier
+        )
+
+        atr_ok = (
+            body >= atr * atr_multiplier
+        )
+
+        body_ok = (
+            body_ratio >= body_ratio_min
+        )
+
+        return (
+            atr_ok
+            and body_ok
+            and volume_ok
+        )
+
+
+    # --------------------------------------
+    # Causal Swing Detection
+    # --------------------------------------
+
+    @staticmethod
+    def detect_swings(
+        df,
+        left=3,
+        right=3
+    ):
+        """
+        Confirmed swing detection.
+
+        Important:
+        A swing is only confirmed AFTER
+        the required right-side candles
+        have closed.
+
+        This prevents look-ahead bias.
+        """
+
+        data = df.copy()
+
+        data["swing_high"] = False
+        data["swing_low"] = False
+
+        if len(data) < left + right + 1:
+            return data
+
+        highs = data["high"].values
+        lows = data["low"].values
+
+        for i in range(
+            left,
+            len(data) - right
+        ):
+
+            left_highs = highs[
+                i - left:i
+            ]
+
+            right_highs = highs[
+                i + 1:i + right + 1
+            ]
+
+            left_lows = lows[
+                i - left:i
+            ]
+
+            right_lows = lows[
+                i + 1:i + right + 1
+            ]
+
+            if (
+                highs[i] > left_highs.max()
+                and
+                highs[i] > right_highs.max()
+            ):
+                data.loc[
+                    data.index[i],
+                    "swing_high"
+                ] = True
+
+            if (
+                lows[i] < left_lows.min()
+                and
+                lows[i] < right_lows.min()
+            ):
+                data.loc[
+                    data.index[i],
+                    "swing_low"
+                ] = True
+
+        return data
+
+
+    # --------------------------------------
+    # Latest Confirmed Swing
+    # --------------------------------------
+
+    @staticmethod
+    def latest_swing_high(df, before_idx=None):
+
+        if before_idx is None:
+            before_idx = len(df) - 1
+
+        candidates = df[
+            (df["swing_high"])
+            &
+            (df.index < df.index[before_idx])
+        ]
+
+        if candidates.empty:
+            return None
+
+        return candidates.iloc[-1]
+
+
+    @staticmethod
+    def latest_swing_low(df, before_idx=None):
+
+        if before_idx is None:
+            before_idx = len(df) - 1
+
+        candidates = df[
+            (df["swing_low"])
+            &
+            (df.index < df.index[before_idx])
+        ]
+
+        if candidates.empty:
+            return None
+
+        return candidates.iloc[-1]
+
+
+    # --------------------------------------
+    # Liquidity Sweep
+    # --------------------------------------
+
+    @staticmethod
+    def detect_liquidity_sweep(
+        df,
+        direction,
+        lookback=20
+    ):
+
+        if len(df) < lookback + 5:
+            return False
+
+        current = df.iloc[-1]
+
+        previous = df.iloc[
+            -lookback:-1
+        ]
+
+        if direction == "LONG":
+
+            liquidity_level = previous["low"].min()
+
+            swept = (
+                current["low"]
+                < liquidity_level
+            )
+
+            reclaimed = (
+                current["close"]
+                > liquidity_level
+            )
+
+            return swept and reclaimed
+
+        if direction == "SHORT":
+
+            liquidity_level = previous["high"].max()
+
+            swept = (
+                current["high"]
+                > liquidity_level
+            )
+
+            rejected = (
+                current["close"]
+                < liquidity_level
+            )
+
+            return swept and rejected
+
+        return False
+
+
+    # --------------------------------------
+    # Market Structure Shift
+    # --------------------------------------
+
+    @staticmethod
+    def detect_mss(
+        df,
+        direction
+    ):
+
+        if len(df) < 15:
+            return False
+
+        swings = SMCMath.detect_swings(
+            df,
+            left=3,
+            right=3
+        )
+
+        current_close = swings["close"].iloc[-1]
+
+        if direction == "LONG":
+
+            swing_highs = swings[
+                swings["swing_high"]
+            ]
+
+            if swing_highs.empty:
+                return False
+
+            latest_high = (
+                swing_highs["high"].iloc[-1]
+            )
+
+            return (
+                current_close
+                > latest_high
+            )
+
+        if direction == "SHORT":
+
+            swing_lows = swings[
+                swings["swing_low"]
+            ]
+
+            if swing_lows.empty:
+                return False
+
+            latest_low = (
+                swing_lows["low"].iloc[-1]
+            )
+
+            return (
+                current_close
+                < latest_low
+            )
+
+        return False
+
+
+    # --------------------------------------
+    # BOS
+    # --------------------------------------
+
+    @staticmethod
+    def detect_bos(
+        df,
+        direction,
+        lookback=10
+    ):
+
+        if len(df) < lookback + 2:
+            return False
+
+        current = df.iloc[-1]
+
+        previous = df.iloc[
+            -lookback:-1
+        ]
+
+        if direction == "LONG":
+
+            structure_high = (
+                previous["high"].max()
+            )
+
+            return (
+                current["close"]
+                > structure_high
+            )
+
+        if direction == "SHORT":
+
+            structure_low = (
+                previous["low"].min()
+            )
+
+            return (
+                current["close"]
+                < structure_low
+            )
+
+        return False
+
+
+    # --------------------------------------
+    # FVG Detection
+    # --------------------------------------
+
+    @staticmethod
+    def detect_fvg(df):
+
+        bullish_fvg = []
+        bearish_fvg = []
+
+        if len(df) < 3:
+            return {
+                "bullish": bullish_fvg,
+                "bearish": bearish_fvg
+            }
+
+        for i in range(2, len(df)):
+
+            c1 = df.iloc[i - 2]
+            c3 = df.iloc[i]
+
+            # Bullish FVG
+            if c1["high"] < c3["low"]:
+
+                bullish_fvg.append({
+                    "index": i,
+                    "low": c1["high"],
+                    "high": c3["low"],
+                    "type": "BULLISH_FVG"
+                })
+
+            # Bearish FVG
+            if c1["low"] > c3["high"]:
+
+                bearish_fvg.append({
+                    "index": i,
+                    "low": c3["high"],
+                    "high": c1["low"],
+                    "type": "BEARISH_FVG"
+                })
+
+        return {
+            "bullish": bullish_fvg,
+            "bearish": bearish_fvg
+        }
+
+
+    # --------------------------------------
+    # POI Proximity
+    # --------------------------------------
+
+    @staticmethod
+    def poi_proximity(
+        current_price,
+        poi,
+        max_distance_pct=1.5
+    ):
+
+        if poi is None:
+            return False
+
+        distance = (
+            abs(
+                current_price
+                - (
+                    poi["high"]
+                    + poi["low"]
+                ) / 2
+            )
+            / current_price
+        ) * 100
+
+        return (
+            distance
+            <= max_distance_pct
+        )
+
+
+    # --------------------------------------
+    # Candle Direction
+    # --------------------------------------
+
+    @staticmethod
+    def candle_direction(
+        df,
+        idx=-1
+    ):
+
+        candle = df.iloc[idx]
+
+        if candle["close"] > candle["open"]:
+            return "BULLISH"
+
+        if candle["close"] < candle["open"]:
+            return "BEARISH"
+
+        return "NEUTRAL"
+
+
+    # --------------------------------------
+    # Volatility Regime
+    # --------------------------------------
+
+    @staticmethod
+    def volatility_regime(df):
+
+        atr = SMCMath.calculate_atr(
+            df,
+            14
+        )
+
+        if atr.isna().all():
+            return "UNKNOWN"
+
+        current_atr = atr.iloc[-1]
+
+        median_atr = (
+            atr.dropna()
+            .tail(50)
+            .median()
+        )
+
+        if current_atr > median_atr * 1.5:
+            return "HIGH"
+
+        if current_atr < median_atr * 0.7:
+            return "LOW"
+
+        return "NORMAL"
+    # ==========================================
+# PART 3 — MARKET REGIME + HTF + POI ENGINE
 # ==========================================
-# 6. STREAMLIT UI - DASHBOARD V1.7.5
-# ==========================================
-st.title("🚀 COSMIC 108 | V1.7.5 Zero-Dependency Radar")
-st.markdown("**Native Pandas Technical Engine • Active FVG/OB Confluence • ATR Risk Engine**")
 
-col_btn1, col_btn2 = st.columns(2)
-with col_btn1:
-    if st.button("📥 STEP 1: INGEST LIVE MARKET DATA", type="secondary", use_container_width=True):
-        prog = st.progress(0)
-        txt = st.empty()
-        with st.spinner("Fetching live candles securely from KuCoin..."):
-            cnt = fetch_and_store_live_candles(prog, txt)
-        txt.text("✅ Live Ingestion Complete!")
-        st.success(f"Successfully ingested {cnt} new candles.")
-        
-with col_btn2:
-    if st.button("🧠 STEP 2: RUN V1.7.5 INSTITUTIONAL PIPELINE", type="primary", use_container_width=True):
-        with st.spinner("Executing Native Indicators, Causal Swings & Risk Engine..."):
-            for coin in TARGET_COINS:
-                for tf in TIMEFRAMES:
-                    raw_df = load_raw_candles(coin, tf)
-                    analyzed_df, p5_records = run_v175_analysis(raw_df)
-                    save_to_db(analyzed_df, p5_records)
-            st.success("✅ V1.7.5 Pipeline Executed Successfully!")
+class MarketRegimeEngine:
 
-st.divider()
+    @staticmethod
+    def get_trend(df, fast=20, slow=50):
 
-selected_signal_coin = st.selectbox("Select Asset for V1.7.5 Signal Card", TARGET_COINS)
-signal_data = generate_v175_signal(selected_signal_coin)
+        if df is None or len(df) < slow:
+            return "UNKNOWN"
 
-if signal_data:
-    with st.container(border=True):
-        st.markdown(f"### 🛡️ {selected_signal_coin} | Institutional Signal Card (V1.7.5)")
-        
-        if signal_data['direction'] == '⚪ NO TRADE':
-            st.error(f"**⚪ NO TRADE**")
-            st.markdown(f"*Reason: {signal_data['reason']}*")
+        data = df.copy()
+
+        data["ema_fast"] = (
+            data["close"]
+            .ewm(
+                span=fast,
+                adjust=False
+            )
+            .mean()
+        )
+
+        data["ema_slow"] = (
+            data["close"]
+            .ewm(
+                span=slow,
+                adjust=False
+            )
+            .mean()
+        )
+
+        price = data["close"].iloc[-1]
+        fast_ema = data["ema_fast"].iloc[-1]
+        slow_ema = data["ema_slow"].iloc[-1]
+
+        if (
+            price > fast_ema
+            and fast_ema > slow_ema
+        ):
+            return "BULLISH"
+
+        if (
+            price < fast_ema
+            and fast_ema < slow_ema
+        ):
+            return "BEARISH"
+
+        return "CHOP"
+
+
+    @staticmethod
+    def btc_regime(
+        df_1d,
+        df_4h,
+        df_1h
+    ):
+
+        trend_1d = MarketRegimeEngine.get_trend(
+            df_1d
+        )
+
+        trend_4h = MarketRegimeEngine.get_trend(
+            df_4h
+        )
+
+        trend_1h = MarketRegimeEngine.get_trend(
+            df_1h
+        )
+
+        bullish_count = [
+            trend_1d,
+            trend_4h,
+            trend_1h
+        ].count("BULLISH")
+
+        bearish_count = [
+            trend_1d,
+            trend_4h,
+            trend_1h
+        ].count("BEARISH")
+
+        if bullish_count == 3:
+            regime = "STRONG_BULLISH"
+
+        elif bearish_count == 3:
+            regime = "STRONG_BEARISH"
+
+        elif bullish_count >= 2:
+            regime = "BULLISH"
+
+        elif bearish_count >= 2:
+            regime = "BEARISH"
+
         else:
-            color = "green" if signal_data['direction'] == 'BULLISH' else "red"
-            trigger_badge = "🔥 5M TRIGGERED" if signal_data['trigger'] == 1 else "⏳ WAITING FOR 5M TRIGGER"
-            
-            st.markdown(f"<h2 style='color:{color};'>{signal_data['direction']} — {signal_data['score']}/100</h2>", unsafe_allow_html=True)
-            st.markdown(f"**{signal_data['grade']}** | Status: `{signal_data['status']}` | {trigger_badge}")
-            
-            st.markdown("---")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("MTF Alignment", signal_data['mtf_alignment'])
-            c2.metric("Structure Quality", signal_data['bos_choch'])
-            c3.metric("Active Confluence Score", f"{signal_data['phase5_score']} / 5 pts")
-            c4.metric("Volume Quality", signal_data['volume_quality'])
-            
-            st.markdown("---")
-            st.markdown("#### 🎯 Institutional Trade Plan (ATR-Buffered SL)")
-            r1, r2, r3, r4, r5 = st.columns(5)
-            r1.metric("Entry Price", f"${signal_data['entry_price']}")
-            r2.metric("Stop Loss", f"${signal_data['stop_loss']}")
-            r3.metric("Take Profit 1", f"${signal_data['take_profit_1']}")
-            r4.metric("Take Profit 2", f"${signal_data['take_profit_2']}")
-            r5.metric("Est. R:R", f"1 : {signal_data['risk_reward']}")
-else:
-    st.info("Analysis pending. Please run Step 1 (Ingest) and Step 2 (Pipeline) above.")
+            regime = "CHOP"
+
+        return {
+            "regime": regime,
+            "1d": trend_1d,
+            "4h": trend_4h,
+            "1h": trend_1h
+        }
+
+
+    @staticmethod
+    def allow_direction(
+        regime,
+        direction
+    ):
+
+        if direction == "LONG":
+
+            return regime in [
+                "BULLISH",
+                "STRONG_BULLISH"
+            ]
+
+        if direction == "SHORT":
+
+            return regime in [
+                "BEARISH",
+                "STRONG_BEARISH"
+            ]
+
+        return False
+
+
+# ==========================================
+# HTF ALIGNMENT ENGINE
+# ==========================================
+
+class HTFAlignmentEngine:
+
+    @staticmethod
+    def analyze(
+        df_1d,
+        df_4h,
+        df_1h,
+        direction
+    ):
+
+        trend_1d = MarketRegimeEngine.get_trend(
+            df_1d
+        )
+
+        trend_4h = MarketRegimeEngine.get_trend(
+            df_4h
+        )
+
+        trend_1h = MarketRegimeEngine.get_trend(
+            df_1h
+        )
+
+        trends = [
+            trend_1d,
+            trend_4h,
+            trend_1h
+        ]
+
+        if direction == "LONG":
+
+            aligned = all(
+                x == "BULLISH"
+                for x in trends
+            )
+
+        elif direction == "SHORT":
+
+            aligned = all(
+                x == "BEARISH"
+                for x in trends
+            )
+
+        else:
+            aligned = False
+
+        return {
+            "aligned": aligned,
+            "1d": trend_1d,
+            "4h": trend_4h,
+            "1h": trend_1h
+        }
+
+
+# ==========================================
+# 15M POI ENGINE
+# ==========================================
+
+class POIEngine:
+
+    def __init__(
+        self,
+        proximity_pct=1.5
+    ):
+
+        self.proximity_pct = (
+            proximity_pct
+        )
+
+
+    # --------------------------------------
+    # Detect Order Blocks
+    # --------------------------------------
+
+    @staticmethod
+    def detect_order_blocks(df):
+
+        bullish_obs = []
+        bearish_obs = []
+
+        if len(df) < 5:
+            return {
+                "bullish": bullish_obs,
+                "bearish": bearish_obs
+            }
+
+        for i in range(
+            2,
+            len(df) - 1
+        ):
+
+            current = df.iloc[i]
+            next_candle = df.iloc[i + 1]
+
+            # ----------------------------------
+            # Bullish Order Block
+            # Last bearish candle before
+            # strong bullish expansion
+            # ----------------------------------
+
+            if (
+                current["close"]
+                < current["open"]
+            ):
+
+                next_body = abs(
+                    next_candle["close"]
+                    - next_candle["open"]
+                )
+
+                next_range = (
+                    next_candle["high"]
+                    - next_candle["low"]
+                )
+
+                if next_range > 0:
+
+                    body_ratio = (
+                        next_body
+                        / next_range
+                    )
+
+                    if (
+                        next_candle["close"]
+                        > current["high"]
+                        and body_ratio >= 0.60
+                    ):
+
+                        bullish_obs.append({
+                            "index": i,
+                            "low": current["low"],
+                            "high": current["high"],
+                            "type": "BULLISH_OB"
+                        })
+
+
+            # ----------------------------------
+            # Bearish Order Block
+            # Last bullish candle before
+            # strong bearish expansion
+            # ----------------------------------
+
+            if (
+                current["close"]
+                > current["open"]
+            ):
+
+                next_body = abs(
+                    next_candle["close"]
+                    - next_candle["open"]
+                )
+
+                next_range = (
+                    next_candle["high"]
+                    - next_candle["low"]
+                )
+
+                if next_range > 0:
+
+                    body_ratio = (
+                        next_body
+                        / next_range
+                    )
+
+                    if (
+                        next_candle["close"]
+                        < current["low"]
+                        and body_ratio >= 0.60
+                    ):
+
+                        bearish_obs.append({
+                            "index": i,
+                            "low": current["low"],
+                            "high": current["high"],
+                            "type": "BEARISH_OB"
+                        })
+
+        return {
+            "bullish": bullish_obs,
+            "bearish": bearish_obs
+        }
+
+
+    # --------------------------------------
+    # Build Directional POI
+    # --------------------------------------
+
+    def get_directional_pois(
+        self,
+        df_15m,
+        direction
+    ):
+
+        fvg_data = (
+            SMCMath.detect_fvg(
+                df_15m
+            )
+        )
+
+        ob_data = (
+            self.detect_order_blocks(
+                df_15m
+            )
+        )
+
+        pois = []
+
+        if direction == "LONG":
+
+            pois.extend(
+                fvg_data["bullish"]
+            )
+
+            pois.extend(
+                ob_data["bullish"]
+            )
+
+        elif direction == "SHORT":
+
+            pois.extend(
+                fvg_data["bearish"]
+            )
+
+            pois.extend(
+                ob_data["bearish"]
+            )
+
+        return pois
+
+
+    # --------------------------------------
+    # Find Nearest POI
+    # --------------------------------------
+
+    def find_nearest_poi(
+        self,
+        current_price,
+        pois
+    ):
+
+        if not pois:
+            return None
+
+        ranked = []
+
+        for poi in pois:
+
+            midpoint = (
+                poi["low"]
+                + poi["high"]
+            ) / 2
+
+            distance_pct = (
+                abs(
+                    current_price
+                    - midpoint
+                )
+                / current_price
+            ) * 100
+
+            ranked.append({
+                "poi": poi,
+                "distance_pct": distance_pct
+            })
+
+        ranked.sort(
+            key=lambda x:
+            x["distance_pct"]
+        )
+
+        nearest = ranked[0]
+
+        if (
+            nearest["distance_pct"]
+            <= self.proximity_pct
+        ):
+
+            result = nearest["poi"].copy()
+
+            result["distance_pct"] = (
+                nearest["distance_pct"]
+            )
+
+            return result
+
+        return None
+
+
+# ==========================================
+# DIRECTION ENGINE
+# ==========================================
+
+class DirectionEngine:
+
+    @staticmethod
+    def determine(
+        htf_result,
+        btc_regime
+    ):
+
+        long_score = 0
+        short_score = 0
+
+        # ----------------------------------
+        # HTF
+        # ----------------------------------
+
+        if htf_result["1d"] == "BULLISH":
+            long_score += 2
+
+        if htf_result["4h"] == "BULLISH":
+            long_score += 2
+
+        if htf_result["1h"] == "BULLISH":
+            long_score += 2
+
+        if htf_result["1d"] == "BEARISH":
+            short_score += 2
+
+        if htf_result["4h"] == "BEARISH":
+            short_score += 2
+
+        if htf_result["1h"] == "BEARISH":
+            short_score += 2
+
+        # ----------------------------------
+        # BTC Regime
+        # ----------------------------------
+
+        if btc_regime in [
+            "BULLISH",
+            "STRONG_BULLISH"
+        ]:
+
+            long_score += 2
+
+        if btc_regime in [
+            "BEARISH",
+            "STRONG_BEARISH"
+        ]:
+
+            short_score += 2
+
+        # ----------------------------------
+        # Final Direction
+        # ----------------------------------
+
+        if long_score >= 6 and (
+            long_score > short_score
+        ):
+
+            return {
+                "direction": "LONG",
+                "long_score": long_score,
+                "short_score": short_score
+            }
+
+        if short_score >= 6 and (
+            short_score > long_score
+        ):
+
+            return {
+                "direction": "SHORT",
+                "long_score": long_score,
+                "short_score": short_score
+            }
+
+        return {
+            "direction": "NEUTRAL",
+            "long_score": long_score,
+            "short_score": short_score
+        }
+
+
+# ==========================================
+# POI QUALITY ENGINE
+# ==========================================
+
+class POIQualityEngine:
+
+    @staticmethod
+    def evaluate(
+        poi,
+        current_price,
+        direction
+    ):
+
+        if poi is None:
+            return {
+                "valid": False,
+                "quality": 0,
+                "reason": "NO DIRECTIONAL POI"
+            }
+
+        quality = 0
+
+        # ----------------------------------
+        # Correct POI direction
+        # ----------------------------------
+
+        if direction == "LONG":
+
+            if poi["type"] in [
+                "BULLISH_FVG",
+                "BULLISH_OB"
+            ]:
+                quality += 30
+
+        elif direction == "SHORT":
+
+            if poi["type"] in [
+                "BEARISH_FVG",
+                "BEARISH_OB"
+            ]:
+                quality += 30
+
+        # ----------------------------------
+        # Proximity
+        # ----------------------------------
+
+        distance = poi.get(
+            "distance_pct",
+            999
+        )
+
+        if distance <= 0.50:
+            quality += 30
+
+        elif distance <= 1.00:
+            quality += 20
+
+        elif distance <= 1.50:
+            quality += 10
+
+        # ----------------------------------
+        # POI Type Bonus
+        # ----------------------------------
+
+        if poi["type"] in [
+            "BULLISH_OB",
+            "BEARISH_OB"
+        ]:
+            quality += 20
+
+        if poi["type"] in [
+            "BULLISH_FVG",
+            "BEARISH_FVG"
+        ]:
+            quality += 15
+
+        # ----------------------------------
+        # Final Quality
+        # ----------------------------------
+
+        quality = min(
+            quality,
+            100
+        )
+
+        return {
+            "valid": quality >= 50,
+            "quality": quality,
+            "distance_pct": round(
+                distance,
+                3
+            ),
+            "type": poi["type"]
+        }
+    # ==========================================
+# PART 4 — EXECUTION CHAIN + RISK + SCORING
+# ==========================================
+
+class SetupState:
+
+    IDLE = "IDLE"
+    POI_FOUND = "POI_FOUND"
+    SWEEP_DETECTED = "SWEEP_DETECTED"
+    MSS_CONFIRMED = "MSS_CONFIRMED"
+    DISPLACEMENT = "DISPLACEMENT"
+    BOS_CONFIRMED = "BOS_CONFIRMED"
+    RETEST_CONFIRMED = "RETEST_CONFIRMED"
+    EXPIRED = "EXPIRED"
+
+
+class SetupTracker:
+
+    def __init__(self, symbol):
+
+        self.symbol = symbol
+
+        self.state = SetupState.IDLE
+
+        self.state_index = None
+
+        self.sweep_index = None
+
+        self.active_poi = None
+
+        self.direction = None
+
+        self.signal_id = None
+
+        self.last_signal_timestamp = 0
+
+        self.cooldown_seconds = 1800
+
+        self.expiry_rules = {
+            SetupState.SWEEP_DETECTED: 6,
+            SetupState.MSS_CONFIRMED: 4,
+            SetupState.DISPLACEMENT: 3,
+            SetupState.BOS_CONFIRMED: 3
+        }
+
+
+    # --------------------------------------
+    # Reset Setup
+    # --------------------------------------
+
+    def reset(self):
+
+        self.state = SetupState.IDLE
+
+        self.state_index = None
+
+        self.sweep_index = None
+
+        self.active_poi = None
+
+        self.direction = None
+
+        self.signal_id = None
+
+
+    # --------------------------------------
+    # Start New Setup
+    # --------------------------------------
+
+    def start_setup(
+        self,
+        direction,
+        poi,
+        current_index
+    ):
+
+        self.direction = direction
+
+        self.active_poi = poi
+
+        self.state = SetupState.POI_FOUND
+
+        self.state_index = current_index
+
+        self.sweep_index = None
+
+        self.signal_id = (
+            f"{self.symbol}_"
+            f"{direction}_"
+            f"{current_index}"
+        )
+
+
+    # --------------------------------------
+    # State Transition
+    # --------------------------------------
+
+    def transition(
+        self,
+        new_state,
+        current_index
+    ):
+
+        self.state = new_state
+
+        self.state_index = current_index
+
+        if new_state == SetupState.SWEEP_DETECTED:
+
+            self.sweep_index = current_index
+
+
+    # --------------------------------------
+    # Dynamic Expiry
+    # --------------------------------------
+
+    def check_expiry(
+        self,
+        current_index
+    ):
+
+        if self.state == SetupState.IDLE:
+            return False
+
+        if self.state not in self.expiry_rules:
+            return False
+
+        if self.state_index is None:
+            return False
+
+        max_candles = (
+            self.expiry_rules[
+                self.state
+            ]
+        )
+
+        candles_passed = (
+            current_index
+            - self.state_index
+        )
+
+        if candles_passed > max_candles:
+
+            self.state = SetupState.EXPIRED
+
+            return True
+
+        return False
+
+
+    # --------------------------------------
+    # Cooldown
+    # --------------------------------------
+
+    def cooldown_active(self):
+
+        return (
+            time.time()
+            - self.last_signal_timestamp
+            < self.cooldown_seconds
+        )
+
+
+    def mark_signal_sent(self):
+
+        self.last_signal_timestamp = (
+            time.time()
+        )
+
+
+# ==========================================
+# MSS / BOS / RETEST CHAIN
+# ==========================================
+
+class ExecutionChain:
+
+    @staticmethod
+    def detect_mss_after_sweep(
+        df,
+        sweep_index,
+        direction
+    ):
+
+        if sweep_index is None:
+            return False
+
+        if sweep_index >= len(df) - 1:
+            return False
+
+        post_sweep = df.iloc[
+            sweep_index + 1:
+        ]
+
+        if len(post_sweep) < 2:
+            return False
+
+        structure = df.iloc[
+            max(0, sweep_index - 10):
+            sweep_index
+        ]
+
+        if structure.empty:
+            return False
+
+        if direction == "LONG":
+
+            reference_high = (
+                structure["high"].max()
+            )
+
+            return (
+                post_sweep["close"].max()
+                > reference_high
+            )
+
+        if direction == "SHORT":
+
+            reference_low = (
+                structure["low"].min()
+            )
+
+            return (
+                post_sweep["close"].min()
+                < reference_low
+            )
+
+        return False
+
+
+    # --------------------------------------
+    # Displacement after MSS
+    # --------------------------------------
+
+    @staticmethod
+    def detect_displacement_after_mss(
+        df,
+        mss_index,
+        direction
+    ):
+
+        if mss_index is None:
+            return False
+
+        if mss_index >= len(df):
+            return False
+
+        for i in range(
+            mss_index,
+            len(df)
+        ):
+
+            if SMCMath.displacement(
+                df,
+                i
+            ):
+
+                candle = df.iloc[i]
+
+                if direction == "LONG":
+                    if (
+                        candle["close"]
+                        > candle["open"]
+                    ):
+                        return True
+
+                if direction == "SHORT":
+                    if (
+                        candle["close"]
+                        < candle["open"]
+                    ):
+                        return True
+
+        return False
+
+
+    # --------------------------------------
+    # BOS after displacement
+    # --------------------------------------
+
+    @staticmethod
+    def detect_bos_after_displacement(
+        df,
+        displacement_index,
+        direction
+    ):
+
+        if displacement_index is None:
+            return False
+
+        if displacement_index >= len(df) - 1:
+            return False
+
+        structure = df.iloc[
+            max(
+                0,
+                displacement_index - 10
+            ):
+            displacement_index
+        ]
+
+        if structure.empty:
+            return False
+
+        current = df.iloc[-1]
+
+        if direction == "LONG":
+
+            swing_high = (
+                structure["high"].max()
+            )
+
+            return (
+                current["close"]
+                > swing_high
+            )
+
+        if direction == "SHORT":
+
+            swing_low = (
+                structure["low"].min()
+            )
+
+            return (
+                current["close"]
+                < swing_low
+            )
+
+        return False
+
+
+    # --------------------------------------
+    # POI Retest
+    # --------------------------------------
+
+    @staticmethod
+    def detect_retest(
+        current_price,
+        poi,
+        direction,
+        tolerance_pct=0.30
+    ):
+
+        if poi is None:
+            return False
+
+        poi_low = poi["low"]
+        poi_high = poi["high"]
+
+        tolerance = (
+            current_price
+            * tolerance_pct
+            / 100
+        )
+
+        if direction == "LONG":
+
+            return (
+                current_price
+                >= poi_low - tolerance
+                and
+                current_price
+                <= poi_high + tolerance
+            )
+
+        if direction == "SHORT":
+
+            return (
+                current_price
+                >= poi_low - tolerance
+                and
+                current_price
+                <= poi_high + tolerance
+            )
+
+        return False
+
+
+# ==========================================
+# REALISTIC RISK ENGINE
+# ==========================================
+
+class RiskEngine:
+
+    def __init__(
+        self,
+        risk_usd=10.0,
+        taker_fee=0.0008,
+        maker_fee=0.0006,
+        slippage=0.0005
+    ):
+
+        self.risk_usd = risk_usd
+
+        self.taker_fee = taker_fee
+
+        self.maker_fee = maker_fee
+
+        self.slippage = slippage
+
+
+    # --------------------------------------
+    # Calculate SL / TP
+    # --------------------------------------
+
+    def calculate_levels(
+        self,
+        df,
+        direction
+    ):
+
+        atr_series = (
+            SMCMath.calculate_atr(df)
+        )
+
+        atr = atr_series.iloc[-1]
+
+        if pd.isna(atr) or atr <= 0:
+            return None
+
+        price = df["close"].iloc[-1]
+
+        recent_high = (
+            df["high"]
+            .tail(10)
+            .max()
+        )
+
+        recent_low = (
+            df["low"]
+            .tail(10)
+            .min()
+        )
+
+        if direction == "LONG":
+
+            structure_sl = (
+                recent_low
+                - atr * 0.20
+            )
+
+            sl = min(
+                structure_sl,
+                price - atr * 1.0
+            )
+
+            risk_per_unit = (
+                price - sl
+            )
+
+            tp = (
+                price
+                + risk_per_unit * 2.5
+            )
+
+        elif direction == "SHORT":
+
+            structure_sl = (
+                recent_high
+                + atr * 0.20
+            )
+
+            sl = max(
+                structure_sl,
+                price + atr * 1.0
+            )
+
+            risk_per_unit = (
+                sl - price
+            )
+
+            tp = (
+                price
+                - risk_per_unit * 2.5
+            )
+
+        else:
+            return None
+
+        if risk_per_unit <= 0:
+            return None
+
+        return {
+            "entry": price,
+            "sl": sl,
+            "tp": tp,
+            "atr": atr,
+            "risk_per_unit": risk_per_unit
+        }
+
+
+    # --------------------------------------
+    # Realistic Execution
+    # --------------------------------------
+
+    def calculate_execution(
+        self,
+        levels,
+        direction
+    ):
+
+        if levels is None:
+            return {
+                "valid": False,
+                "reason": "NO RISK LEVELS"
+            }
+
+        entry = levels["entry"]
+
+        sl = levels["sl"]
+
+        tp = levels["tp"]
+
+        if direction == "LONG":
+
+            effective_entry = (
+                entry
+                * (1 + self.slippage)
+            )
+
+            effective_sl = (
+                sl
+                * (1 - self.slippage)
+            )
+
+            risk_per_unit = (
+                effective_entry
+                - effective_sl
+            )
+
+            reward_per_unit = (
+                tp
+                - effective_entry
+            )
+
+        elif direction == "SHORT":
+
+            effective_entry = (
+                entry
+                * (1 - self.slippage)
+            )
+
+            effective_sl = (
+                sl
+                * (1 + self.slippage)
+            )
+
+            risk_per_unit = (
+                effective_sl
+                - effective_entry
+            )
+
+            reward_per_unit = (
+                effective_entry
+                - tp
+            )
+
+        else:
+
+            return {
+                "valid": False,
+                "reason": "INVALID DIRECTION"
+            }
+
+        if risk_per_unit <= 0:
+            return {
+                "valid": False,
+                "reason": "INVALID RISK"
+            }
+
+        position_size = (
+            self.risk_usd
+            / risk_per_unit
+        )
+
+        entry_fee = (
+            effective_entry
+            * position_size
+            * self.taker_fee
+        )
+
+        exit_fee = (
+            tp
+            * position_size
+            * self.maker_fee
+        )
+
+        total_fee = (
+            entry_fee
+            + exit_fee
+        )
+
+        gross_reward = (
+            reward_per_unit
+            * position_size
+        )
+
+        net_reward = (
+            gross_reward
+            - total_fee
+        )
+
+        net_risk = (
+            self.risk_usd
+            + total_fee
+        )
+
+        if net_risk <= 0:
+            return {
+                "valid": False,
+                "reason": "INVALID NET RISK"
+            }
+
+        real_rr = (
+            net_reward
+            / net_risk
+        )
+
+        return {
+            "valid": real_rr >= 2.0,
+            "entry": round(
+                effective_entry,
+                6
+            ),
+            "sl": round(
+                effective_sl,
+                6
+            ),
+            "tp": round(
+                tp,
+                6
+            ),
+            "position_size": round(
+                position_size,
+                6
+            ),
+            "fees": round(
+                total_fee,
+                6
+            ),
+            "risk_usd": round(
+                net_risk,
+                2
+            ),
+            "net_reward": round(
+                net_reward,
+                2
+            ),
+            "real_rr": round(
+                real_rr,
+                2
+            )
+        }
+
+
+# ==========================================
+# COMPOSITE SCORING ENGINE
+# ==========================================
+
+class SignalScorer:
+
+    WEIGHTS = {
+
+        "btc_regime": 10,
+
+        "htf_alignment": 15,
+
+        "directional_poi": 10,
+
+        "poi_proximity": 5,
+
+        "liquidity_sweep": 15,
+
+        "mss_choch": 15,
+
+        "displacement": 10,
+
+        "bos_confirmed": 10,
+
+        "retest_confirmed": 5,
+
+        "realistic_rr": 5
+    }
+
+
+    @classmethod
+    def calculate(
+        cls,
+        checks
+    ):
+
+        score = 0
+
+        for key, weight in cls.WEIGHTS.items():
+
+            if checks.get(key, False):
+                score += weight
+
+        score = min(
+            score,
+            100
+        )
+
+        if score >= 90:
+
+            grade = "A+ SETUP"
+
+        elif score >= 80:
+
+            grade = "A SETUP"
+
+        elif score >= 70:
+
+            grade = "B WATCH"
+
+        elif score >= 60:
+
+            grade = "C WATCH"
+
+        else:
+
+            grade = "NO TRADE"
+
+        return score, grade
+
+
+# ==========================================
+# FINAL EXECUTION GATE
+# ==========================================
+
+class FinalExecutionGate:
+
+    REQUIRED = [
+
+        "btc_regime",
+
+        "htf_alignment",
+
+        "directional_poi",
+
+        "poi_proximity",
+
+        "liquidity_sweep",
+
+        "mss_choch",
+
+        "displacement",
+
+        "bos_confirmed",
+
+        "retest_confirmed",
+
+        "realistic_rr"
+    ]
+
+
+    @classmethod
+    def validate(
+        cls,
+        checks
+    ):
+
+        missing = []
+
+        for key in cls.REQUIRED:
+
+            if not checks.get(
+                key,
+                False
+            ):
+
+                missing.append(key)
+
+        return {
+            "approved": len(missing) == 0,
+            "missing": missing
+        }
+    # ==========================================
+# PART 5/5 — LIVE RADAR + SIGNAL ENGINE
+# ==========================================
+
+import time
+from datetime import datetime, timezone
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+
+console = Console()
+
+
+# ==========================================
+# 1. SIGNAL DECISION ENGINE
+# ==========================================
+
+class SignalEngine:
+
+    @staticmethod
+    def evaluate(
+        btc_regime,
+        htf_alignment,
+        poi_valid,
+        poi_proximity,
+        liquidity_sweep,
+        mss_confirmed,
+        displacement,
+        bos_confirmed,
+        retest_confirmed,
+        real_rr
+    ):
+
+        checks = {
+            "BTC REGIME": btc_regime,
+            "HTF ALIGNMENT": htf_alignment,
+            "15M POI": poi_valid,
+            "POI PROXIMITY": poi_proximity,
+            "LIQUIDITY SWEEP": liquidity_sweep,
+            "MSS / CHOCH": mss_confirmed,
+            "DISPLACEMENT": displacement,
+            "BOS": bos_confirmed,
+            "POI RETEST": retest_confirmed,
+            "REALISTIC RR >= 2": real_rr >= 2.0
+        }
+
+        weights = {
+            "BTC REGIME": 5,
+            "HTF ALIGNMENT": 15,
+            "15M POI": 10,
+            "POI PROXIMITY": 5,
+            "LIQUIDITY SWEEP": 15,
+            "MSS / CHOCH": 15,
+            "DISPLACEMENT": 15,
+            "BOS": 10,
+            "POI RETEST": 5,
+            "REALISTIC RR >= 2": 5
+        }
+
+        score = 0
+
+        for key, passed in checks.items():
+            if passed:
+                score += weights[key]
+
+        # ----------------------------------
+        # STRICT EXECUTION GATE
+        # ----------------------------------
+
+        mandatory = all(checks.values())
+
+        if mandatory and score >= 90:
+            grade = "A+ SETUP"
+            status = "VALID SIGNAL"
+
+        elif mandatory and score >= 85:
+            grade = "A SETUP"
+            status = "VALID SIGNAL"
+
+        elif liquidity_sweep and (
+            mss_confirmed or displacement or bos_confirmed
+        ):
+            grade = "WATCH"
+            status = "SETUP FORMING"
+
+        else:
+            grade = "NO TRADE"
+            status = "NO TRADE"
+
+        return {
+            "score": score,
+            "grade": grade,
+            "status": status,
+            "checks": checks
+        }
+
+
+# ==========================================
+# 2. LIVE RADAR
+# ==========================================
+
+class CosmicLiveRadar:
+
+    def __init__(self, symbol="SOL-USDT"):
+
+        self.symbol = symbol
+
+        self.last_signal_id = None
+        self.last_signal_time = 0
+
+        self.cooldown_seconds = 30 * 60
+
+        self.setup_state = "IDLE"
+        self.setup_start_index = None
+
+        self.audit_log = []
+
+
+    # ======================================
+    # COOLDOWN
+    # ======================================
+
+    def cooldown_active(self):
+
+        if self.last_signal_time == 0:
+            return False
+
+        return (
+            time.time() - self.last_signal_time
+            < self.cooldown_seconds
+        )
+
+
+    # ======================================
+    # AUDIT LOG
+    # ======================================
+
+    def log(self, event, score, details):
+
+        self.audit_log.insert(
+            0,
+            {
+                "time": datetime.now(
+                    timezone.utc
+                ).strftime("%H:%M:%S"),
+
+                "event": event,
+                "score": score,
+                "details": details
+            }
+        )
+
+        self.audit_log = self.audit_log[:10]
+
+
+    # ======================================
+    # MAIN ANALYSIS
+    # ======================================
+
+    def analyze(self):
+
+        # ----------------------------------
+        # FETCH MULTI TIMEFRAME DATA
+        # ----------------------------------
+
+        df_1d = KuCoinLive.get_klines(
+            self.symbol,
+            "1day",
+            100
+        )
+
+        df_4h = KuCoinLive.get_klines(
+            self.symbol,
+            "4hour",
+            100
+        )
+
+        df_1h = KuCoinLive.get_klines(
+            self.symbol,
+            "1hour",
+            100
+        )
+
+        df_15m = KuCoinLive.get_klines(
+            self.symbol,
+            "15min",
+            150
+        )
+
+        df_5m = KuCoinLive.get_klines(
+            self.symbol,
+            "5min",
+            200
+        )
+
+
+        # ----------------------------------
+        # DATA VALIDATION
+        # ----------------------------------
+
+        if any(
+            df.empty
+            for df in [
+                df_1d,
+                df_4h,
+                df_1h,
+                df_15m,
+                df_5m
+            ]
+        ):
+
+            return {
+                "status": "NO TRADE",
+                "reason": "DATA FETCH FAILED"
+            }
+
+
+        # ----------------------------------
+        # CURRENT PRICE
+        # ----------------------------------
+
+        price = float(
+            df_5m["close"].iloc[-1]
+        )
+
+
+        # ----------------------------------
+        # DATA QUALITY
+        # ----------------------------------
+
+        data_ok, data_reason = (
+            DataQualityGuard.validate(
+                df_5m,
+                time_frame_min=5
+            )
+        )
+
+        if not data_ok:
+
+            return {
+                "symbol": self.symbol,
+                "price": price,
+                "status": "NO TRADE",
+                "grade": "NO TRADE",
+                "score": 0,
+                "reason": data_reason,
+                "checks": {}
+            }
+
+
+        # ----------------------------------
+        # BTC REGIME
+        # ----------------------------------
+
+        btc_regime = get_btc_regime()
+
+        btc_long_ok = btc_regime in [
+            "STRONG_BULLISH"
+        ]
+
+
+        # ----------------------------------
+        # HTF ALIGNMENT
+        # ----------------------------------
+
+        htf_1d = (
+            df_1d["close"].iloc[-1]
+            >
+            df_1d["close"]
+            .ewm(span=20)
+            .mean()
+            .iloc[-1]
+        )
+
+        htf_4h = (
+            df_4h["close"].iloc[-1]
+            >
+            df_4h["close"]
+            .ewm(span=20)
+            .mean()
+            .iloc[-1]
+        )
+
+        htf_1h = (
+            df_1h["close"].iloc[-1]
+            >
+            df_1h["close"]
+            .ewm(span=20)
+            .mean()
+            .iloc[-1]
+        )
+
+        htf_alignment = (
+            htf_1d
+            and htf_4h
+            and htf_1h
+        )
+
+
+        # ----------------------------------
+        # 15M POI
+        # ----------------------------------
+
+        df_15m = SMCMath.get_swings(
+            df_15m.copy()
+        )
+
+        recent_high = (
+            df_15m["high"]
+            .iloc[-20:-1]
+            .max()
+        )
+
+        recent_low = (
+            df_15m["low"]
+            .iloc[-20:-1]
+            .min()
+        )
+
+
+        # Basic directional POI proximity
+
+        distance_to_low = (
+            abs(price - recent_low)
+            / price
+            * 100
+        )
+
+        distance_to_high = (
+            abs(recent_high - price)
+            / price
+            * 100
+        )
+
+        poi_proximity = (
+            distance_to_low <= 1.5
+        )
+
+        poi_valid = (
+            price >= recent_low
+        )
+
+
+        # ----------------------------------
+        # 5M STRUCTURE
+        # ----------------------------------
+
+        df_5m = SMCMath.get_swings(
+            df_5m.copy()
+        )
+
+        current_idx = len(df_5m) - 1
+
+
+        # ----------------------------------
+        # LIQUIDITY SWEEP
+        # ----------------------------------
+
+        swing_lows = df_5m[
+            df_5m["swing_low"]
+        ]["low"]
+
+        liquidity_sweep = False
+
+        if not swing_lows.empty:
+
+            previous_swing_low = (
+                swing_lows.iloc[-1]
+            )
+
+            current_low = (
+                df_5m["low"].iloc[-1]
+            )
+
+            current_close = (
+                df_5m["close"].iloc[-1]
+            )
+
+            liquidity_sweep = (
+                current_low < previous_swing_low
+                and
+                current_close > previous_swing_low
+            )
+
+
+        # ----------------------------------
+        # DISPLACEMENT
+        # ----------------------------------
+
+        displacement = (
+            SMCMath.check_displacement(
+                df_5m,
+                current_idx
+            )
+        )
+
+
+        # ----------------------------------
+        # CAUSAL MSS
+        # ----------------------------------
+
+        mss_confirmed = False
+
+        if liquidity_sweep:
+
+            previous_high = (
+                df_5m["high"]
+                .iloc[-10:-1]
+                .max()
+            )
+
+            mss_confirmed = (
+                price > previous_high
+            )
+
+
+        # ----------------------------------
+        # BOS
+        # ----------------------------------
+
+        bos_confirmed = False
+
+        if mss_confirmed:
+
+            structure_high = (
+                df_5m["high"]
+                .iloc[-6:-1]
+                .max()
+            )
+
+            bos_confirmed = (
+                price > structure_high
+            )
+
+
+        # ----------------------------------
+        # RETEST
+        # ----------------------------------
+
+        retest_confirmed = False
+
+        if bos_confirmed:
+
+            atr_series = (
+                SMCMath.calculate_atr(
+                    df_5m
+                )
+            )
+
+            atr = atr_series.iloc[-1]
+
+            if pd.notna(atr):
+
+                retest_distance = abs(
+                    price - structure_high
+                )
+
+                retest_confirmed = (
+                    retest_distance
+                    <= atr * 0.5
+                )
+
+
+        # ----------------------------------
+        # TRADE PARAMETERS
+        # ----------------------------------
+
+        entry = price
+
+        sl = min(
+            recent_low,
+            price * 0.995
+        )
+
+        tp = price + (
+            (price - sl) * 2.5
+        )
+
+
+        execution = ExecutionEngine(
+            account_risk_usd=10.0
+        )
+
+        trade = execution.calculate_trade_parameters(
+            entry,
+            sl,
+            tp,
+            "LONG"
+        )
+
+        real_rr = trade.get(
+            "real_rr",
+            0
+        )
+
+
+        # ----------------------------------
+        # FINAL SIGNAL SCORING
+        # ----------------------------------
+
+        result = SignalEngine.evaluate(
+
+            btc_regime=btc_long_ok,
+
+            htf_alignment=htf_alignment,
+
+            poi_valid=poi_valid,
+
+            poi_proximity=poi_proximity,
+
+            liquidity_sweep=liquidity_sweep,
+
+            mss_confirmed=mss_confirmed,
+
+            displacement=displacement,
+
+            bos_confirmed=bos_confirmed,
+
+            retest_confirmed=retest_confirmed,
+
+            real_rr=real_rr
+        )
+
+
+        # ----------------------------------
+        # SIGNAL ID
+        # ----------------------------------
+
+        signal_id = (
+            f"{self.symbol}_"
+            f"{df_5m['timestamp'].iloc[-1]}_"
+            f"{result['grade']}"
+        )
+
+
+        # ----------------------------------
+        # DUPLICATE PROTECTION
+        # ----------------------------------
+
+        valid_signal = (
+            result["status"]
+            == "VALID SIGNAL"
+        )
+
+        if valid_signal:
+
+            if self.cooldown_active():
+
+                result["status"] = (
+                    "COOLDOWN"
+                )
+
+            elif (
+                signal_id
+                == self.last_signal_id
+            ):
+
+                result["status"] = (
+                    "DUPLICATE BLOCKED"
+                )
+
+            else:
+
+                self.last_signal_id = (
+                    signal_id
+                )
+
+                self.last_signal_time = (
+                    time.time()
+                )
+
+                self.log(
+                    "VALID SIGNAL",
+                    result["score"],
+                    f"{result['grade']} | "
+                    f"RR 1:{real_rr}"
+                )
+
+        elif result["grade"] == "WATCH":
+
+            self.log(
+                "SETUP FORMING",
+                result["score"],
+                "SMC chain not completed"
+            )
+
+        else:
+
+            self.log(
+                "NO TRADE",
+                result["score"],
+                result.get(
+                    "reason",
+                    "Mandatory gate failed"
+                )
+            )
+
+
+        # ----------------------------------
+        # FINAL RESULT
+        # ----------------------------------
+
+        return {
+
+            "symbol": self.symbol,
+
+            "price": round(
+                price,
+                4
+            ),
+
+            "btc_regime": btc_regime,
+
+            "status": result[
+                "status"
+            ],
+
+            "grade": result[
+                "grade"
+            ],
+
+            "score": result[
+                "score"
+            ],
+
+            "checks": result[
+                "checks"
+            ],
+
+            "trade": (
+                trade
+                if trade.get("valid")
+                else None
+            ),
+
+            "time": datetime.now(
+                timezone.utc
+            ).strftime(
+                "%Y-%m-%d %H:%M:%S UTC"
+            )
+        }
+
+
+# ==========================================
+# 3. TERMINAL DASHBOARD
+# ==========================================
+
+def render_radar(
+    result,
+    audit_log
+):
+
+    console.clear()
+
+    if "checks" not in result:
+
+        console.print(
+            Panel(
+                str(result),
+                title="COSMIC 108 V3.0"
+            )
+        )
+
+        return
+
+
+    checks = result["checks"]
+
+    table = Table(
+        title=(
+            "COSMIC 108 V3.0 "
+            "— LIVE SMC RADAR"
+        )
+    )
+
+    table.add_column(
+        "Validation",
+        style="cyan"
+    )
+
+    table.add_column(
+        "Status",
+        justify="center"
+    )
+
+
+    for key, passed in checks.items():
+
+        if passed:
+
+            table.add_row(
+                key,
+                "[green]✅ CONFIRMED[/green]"
+            )
+
+        else:
+
+            table.add_row(
+                key,
+                "[red]❌ FAILED[/red]"
+            )
+
+
+    trade = result.get(
+        "trade"
+    )
+
+    trade_text = ""
+
+    if trade:
+
+        trade_text = (
+            f"\nENTRY: {trade['entry']}"
+            f"\nSL: {trade['sl']}"
+            f"\nTP: {trade['tp']}"
+            f"\nREAL RR: 1:{trade['real_rr']}"
+            f"\nPOSITION: {trade['position_size']}"
+        )
+
+
+    main_text = (
+        f"[bold cyan]PAIR:[/bold cyan] "
+        f"{result['symbol']}\n"
+
+        f"[bold yellow]PRICE:[/bold yellow] "
+        f"{result['price']}\n"
+
+        f"[bold cyan]BTC REGIME:[/bold cyan] "
+        f"{result['btc_regime']}\n"
+
+        f"[bold white]SCORE:[/bold white] "
+        f"{result['score']}/100\n"
+
+        f"[bold white]GRADE:[/bold white] "
+        f"{result['grade']}\n"
+
+        f"[bold white]STATUS:[/bold white] "
+        f"{result['status']}\n"
+
+        f"{trade_text}"
+    )
+
+
+    console.print(
+        Panel(
+            main_text,
+            title=(
+                "[bold cyan]"
+                "COSMIC 108 V3.0"
+                "[/bold cyan]"
+            ),
+            expand=False
+        )
+    )
+
+    console.print(table)
+
+
+    # --------------------------------------
+    # AUDIT LOG
+    # --------------------------------------
+
+    log_table = Table(
+        title="LIVE AUDIT LOG"
+    )
+
+    log_table.add_column("TIME")
+    log_table.add_column("EVENT")
+    log_table.add_column("SCORE")
+    log_table.add_column("DETAILS")
+
+
+    for item in audit_log:
+
+        log_table.add_row(
+            item["time"],
+            item["event"],
+            str(item["score"]),
+            item["details"]
+        )
+
+
+    console.print(log_table)
+
+
+# ==========================================
+# 4. LIVE RUNNER
+# ==========================================
+
+def run_cosmic_radar():
+
+    radar = CosmicLiveRadar(
+        "SOL-USDT"
+    )
+
+    console.print(
+        Panel(
+            "[bold cyan]"
+            "COSMIC 108 V3.0"
+            "[/bold cyan]\n"
+            "Starting LIVE SMC Radar...\n"
+            "Connecting to KuCoin...",
+            title="SYSTEM START"
+        )
+    )
+
+    time.sleep(2)
+
+
+    while True:
+
+        try:
+
+            result = radar.analyze()
+
+            render_radar(
+                result,
+                radar.audit_log
+            )
+
+            console.print(
+                "\n[dim]"
+                "Next scan in 30 seconds..."
+                "[/dim]"
+            )
+
+            time.sleep(30)
+
+
+        except KeyboardInterrupt:
+
+            console.print(
+                "\n[bold red]"
+                "COSMIC RADAR STOPPED"
+                "[/bold red]"
+            )
+
+            break
+
+
+        except Exception as e:
+
+            console.print(
+                Panel(
+                    f"[red]"
+                    f"ENGINE ERROR: {e}"
+                    f"[/red]",
+                    title="ERROR"
+                )
+            )
+
+            time.sleep(10)
+
+
+# ==========================================
+# 5. START ENGINE
+# ==========================================
+
+if __name__ == "__main__":
+
+    run_cosmic_radar()
+# ==========================================
+# PART 6 — FVG + ORDER BLOCK + POI ENGINE
+# ==========================================
+
+class POIEngine:
+
+    def __init__(
+        self,
+        proximity_pct=1.5,
+        max_fvg_age=40,
+        max_ob_age=60
+    ):
+        self.proximity_pct = proximity_pct
+        self.max_fvg_age = max_fvg_age
+        self.max_ob_age = max_ob_age
+
+
+    # ======================================
+    # FAIR VALUE GAP DETECTION
+    # ======================================
+
+    @staticmethod
+    def detect_fvg(df):
+
+        fvgs = []
+
+        if len(df) < 5:
+            return fvgs
+
+        for i in range(2, len(df)):
+
+            c1 = df.iloc[i - 2]
+            c2 = df.iloc[i - 1]
+            c3 = df.iloc[i]
+
+            # --------------------------------
+            # BULLISH FVG
+            # Candle 3 LOW > Candle 1 HIGH
+            # --------------------------------
+
+            if c3["low"] > c1["high"]:
+
+                fvgs.append({
+                    "type": "BULLISH_FVG",
+                    "index": i,
+                    "low": float(c1["high"]),
+                    "high": float(c3["low"]),
+                    "timestamp": int(c3["timestamp"])
+                })
+
+
+            # --------------------------------
+            # BEARISH FVG
+            # Candle 3 HIGH < Candle 1 LOW
+            # --------------------------------
+
+            if c3["high"] < c1["low"]:
+
+                fvgs.append({
+                    "type": "BEARISH_FVG",
+                    "index": i,
+                    "low": float(c3["high"]),
+                    "high": float(c1["low"]),
+                    "timestamp": int(c3["timestamp"])
+                })
+
+        return fvgs
+
+
+    # ======================================
+    # ORDER BLOCK DETECTION
+    # ======================================
+
+    @staticmethod
+    def detect_order_blocks(df):
+
+        order_blocks = []
+
+        if len(df) < 10:
+            return order_blocks
+
+        for i in range(2, len(df) - 2):
+
+            candle = df.iloc[i]
+
+            next_1 = df.iloc[i + 1]
+            next_2 = df.iloc[i + 2]
+
+
+            # --------------------------------
+            # BULLISH ORDER BLOCK
+            #
+            # Last bearish candle before
+            # strong bullish expansion
+            # --------------------------------
+
+            if (
+                candle["close"] < candle["open"]
+                and
+                next_1["close"] > next_1["open"]
+                and
+                next_2["close"] > next_2["open"]
+            ):
+
+                bullish_impulse = (
+                    next_2["close"]
+                    >
+                    candle["high"]
+                )
+
+                if bullish_impulse:
+
+                    order_blocks.append({
+                        "type": "BULLISH_OB",
+                        "index": i,
+                        "low": float(candle["low"]),
+                        "high": float(candle["high"]),
+                        "timestamp": int(
+                            candle["timestamp"]
+                        )
+                    })
+
+
+            # --------------------------------
+            # BEARISH ORDER BLOCK
+            #
+            # Last bullish candle before
+            # strong bearish expansion
+            # --------------------------------
+
+            if (
+                candle["close"] > candle["open"]
+                and
+                next_1["close"] < next_1["open"]
+                and
+                next_2["close"] < next_2["open"]
+            ):
+
+                bearish_impulse = (
+                    next_2["close"]
+                    <
+                    candle["low"]
+                )
+
+                if bearish_impulse:
+
+                    order_blocks.append({
+                        "type": "BEARISH_OB",
+                        "index": i,
+                        "low": float(candle["low"]),
+                        "high": float(candle["high"]),
+                        "timestamp": int(
+                            candle["timestamp"]
+                        )
+                    })
+
+        return order_blocks
+
+
+    # ======================================
+    # REMOVE OLD / INVALID POIs
+    # ======================================
+
+    def filter_active_pois(
+        self,
+        pois,
+        current_index
+    ):
+
+        active = []
+
+        for poi in pois:
+
+            age = (
+                current_index
+                -
+                poi["index"]
+            )
+
+            if poi["type"].endswith("_FVG"):
+
+                if age <= self.max_fvg_age:
+                    active.append(poi)
+
+            elif poi["type"].endswith("_OB"):
+
+                if age <= self.max_ob_age:
+                    active.append(poi)
+
+        return active
+
+
+    # ======================================
+    # DIRECTIONAL POI FILTER
+    # ======================================
+
+    @staticmethod
+    def directional_pois(
+        pois,
+        direction
+    ):
+
+        if direction == "LONG":
+
+            return [
+                p for p in pois
+                if p["type"] in [
+                    "BULLISH_FVG",
+                    "BULLISH_OB"
+                ]
+            ]
+
+        if direction == "SHORT":
+
+            return [
+                p for p in pois
+                if p["type"] in [
+                    "BEARISH_FVG",
+                    "BEARISH_OB"
+                ]
+            ]
+
+        return []
+
+
+    # ======================================
+    # PRICE PROXIMITY
+    # ======================================
+
+    def check_proximity(
+        self,
+        price,
+        pois
+    ):
+
+        nearby = []
+
+        if not pois:
+            return False, nearby
+
+
+        for poi in pois:
+
+            poi_low = poi["low"]
+            poi_high = poi["high"]
+
+
+            # Price already inside POI
+
+            inside = (
+                poi_low
+                <= price
+                <= poi_high
+            )
+
+
+            # Distance to POI
+
+            if price > poi_high:
+
+                distance = (
+                    (price - poi_high)
+                    / price
+                    * 100
+                )
+
+            elif price < poi_low:
+
+                distance = (
+                    (poi_low - price)
+                    / price
+                    * 100
+                )
+
+            else:
+
+                distance = 0.0
+
+
+            if (
+                inside
+                or
+                distance <= self.proximity_pct
+            ):
+
+                poi_copy = poi.copy()
+
+                poi_copy["distance_pct"] = (
+                    round(distance, 4)
+                )
+
+                poi_copy["inside"] = inside
+
+                nearby.append(
+                    poi_copy
+                )
+
+
+        return len(nearby) > 0, nearby
+
+
+    # ======================================
+    # BEST POI SELECTION
+    # ======================================
+
+    @staticmethod
+    def select_best_poi(
+        pois
+    ):
+
+        if not pois:
+            return None
+
+
+        # Prefer POI where price is already
+        # inside the zone.
+
+        inside_pois = [
+            p for p in pois
+            if p.get("inside", False)
+        ]
+
+        if inside_pois:
+
+            return sorted(
+                inside_pois,
+                key=lambda x: x.get(
+                    "distance_pct",
+                    999
+                )
+            )[0]
+
+
+        return sorted(
+            pois,
+            key=lambda x: x.get(
+                "distance_pct",
+                999
+            )
+        )[0]
+
+
+    # ======================================
+    # COMPLETE POI ANALYSIS
+    # ======================================
+
+    def analyze(
+        self,
+        df,
+        price,
+        direction
+    ):
+
+        if df is None or df.empty:
+
+            return {
+                "valid": False,
+                "proximity": False,
+                "best_poi": None,
+                "pois": []
+            }
+
+
+        current_index = (
+            len(df) - 1
+        )
+
+
+        # ----------------------------------
+        # Detect FVG
+        # ----------------------------------
+
+        fvgs = self.detect_fvg(
+            df
+        )
+
+
+        # ----------------------------------
+        # Detect Order Blocks
+        # ----------------------------------
+
+        obs = self.detect_order_blocks(
+            df
+        )
+
+
+        # ----------------------------------
+        # Combine
+        # ----------------------------------
+
+        all_pois = (
+            fvgs + obs
+        )
+
+
+        # ----------------------------------
+        # Remove expired POIs
+        # ----------------------------------
+
+        active_pois = (
+            self.filter_active_pois(
+                all_pois,
+                current_index
+            )
+        )
+
+
+        # ----------------------------------
+        # Directional filter
+        # ----------------------------------
+
+        directional = (
+            self.directional_pois(
+                active_pois,
+                direction
+            )
+        )
+
+
+        # ----------------------------------
+        # Proximity
+        # ----------------------------------
+
+        proximity, nearby = (
+            self.check_proximity(
+                price,
+                directional
+            )
+        )
+
+
+        # ----------------------------------
+        # Best POI
+        # ----------------------------------
+
+        best = (
+            self.select_best_poi(
+                nearby
+            )
+        )
+
+
+        return {
+
+            "valid": (
+                len(directional) > 0
+            ),
+
+            "proximity": proximity,
+
+            "best_poi": best,
+
+            "pois": nearby,
+
+            "total_active": len(
+                active_pois
+            ),
+
+            "directional_count": len(
+                directional
+            )
+        }
+
+
+# ==========================================
+# POI ENGINE HELPER
+# ==========================================
+
+def get_directional_poi(
+    df_15m,
+    price,
+    direction="LONG"
+):
+
+    engine = POIEngine(
+        proximity_pct=1.5,
+        max_fvg_age=40,
+        max_ob_age=60
+    )
+
+    return engine.analyze(
+        df_15m,
+        price,
+        direction
+            )
