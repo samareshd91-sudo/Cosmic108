@@ -1,6 +1,7 @@
 streamlit
-ccxt
 pandas
 numpy
+ccxt
 requests
-python-dotenv
+plotly
+pandas-ta
